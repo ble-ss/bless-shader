@@ -1,0 +1,270 @@
+{
+	"targets": {
+		"bless:exposure_luma16": { "width": 16, "height": 16, "persistent": false },
+		"bless:exposure_luma1": { "width": 1, "height": 1, "persistent": false },
+		"bless:exposure_new": { "width": 1, "height": 1, "persistent": false },
+		"bless:exposure_history": { "width": 1, "height": 1, "persistent": true, "clear_color": 0 }
+	},
+	"passes": [
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/bloom_extract",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "minecraft:main",
+					"bilinear": true
+				}
+			],
+			"output": "bless:bloom_a",
+			"uniforms": {
+				"BloomExtractConfig": [
+					{
+						"name": "Threshold",
+						"type": "float",
+						"value": 0.80
+					}
+				]
+			}
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/bloom_vertical",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "bless:bloom_a",
+					"bilinear": true
+				},
+				{
+					"sampler_name": "Main",
+					"target": "minecraft:main",
+					"bilinear": false
+				}
+			],
+			"output": "bless:bloom_b"
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/spill_extract",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "minecraft:main",
+					"bilinear": true
+				}
+			],
+			"output": "bless:spill_a",
+			"uniforms": {
+				"SpillExtractConfig": [
+					{
+						"name": "Threshold",
+						"type": "float",
+						"value": 0.55
+					}
+				]
+			}
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/spill_blur",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "bless:spill_a",
+					"bilinear": true
+				}
+			],
+			"output": "bless:spill_b",
+			"uniforms": {
+				"SpillBlurConfig": [
+					{
+						"name": "Direction",
+						"type": "vec2",
+						"value": [ 1.0, 0.0 ]
+					},
+					{
+						"name": "Radius",
+						"type": "float",
+						"value": 6.0
+					}
+				]
+			}
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/spill_blur",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "bless:spill_b",
+					"bilinear": true
+				}
+			],
+			"output": "bless:spill_a",
+			"uniforms": {
+				"SpillBlurConfig": [
+					{
+						"name": "Direction",
+						"type": "vec2",
+						"value": [ 0.0, 1.0 ]
+					},
+					{
+						"name": "Radius",
+						"type": "float",
+						"value": 6.0
+					}
+				]
+			}
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/luma_reduce",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "minecraft:main",
+					"bilinear": false
+				}
+			],
+			"output": "bless:exposure_luma16"
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/luma_final",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "bless:exposure_luma16",
+					"bilinear": false
+				}
+			],
+			"output": "bless:exposure_luma1"
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/exposure_adapt",
+			"inputs": [
+				{
+					"sampler_name": "History",
+					"target": "bless:exposure_history",
+					"bilinear": false
+				},
+				{
+					"sampler_name": "Luma",
+					"target": "bless:exposure_luma1",
+					"bilinear": false
+				}
+			],
+			"output": "bless:exposure_new",
+			"uniforms": {
+				"ExposureConfig": [
+					{
+						"name": "ExposureSettings",
+						"type": "vec4",
+						"value": [ 0.3, 0.5, 2.5, 1.5 ]
+					}
+				]
+			}
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "minecraft:post/blit",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "bless:exposure_new",
+					"bilinear": false
+				}
+			],
+			"output": "bless:exposure_history",
+			"uniforms": {
+				"BlitConfig": [
+					{
+						"name": "ColorModulate",
+						"type": "vec4",
+						"value": [ 1.0, 1.0, 1.0, 1.0 ]
+					}
+				]
+			}
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/bloom_grade",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "minecraft:main",
+					"bilinear": false
+				},
+				{
+					"sampler_name": "Bloom",
+					"target": "bless:bloom_b",
+					"bilinear": true
+				},
+				{
+					"sampler_name": "Spill",
+					"target": "bless:spill_a",
+					"bilinear": true
+				},
+				{
+					"sampler_name": "Exposure",
+					"target": "bless:exposure_new",
+					"bilinear": false
+				}
+			],
+			"output": "bless:scratch",
+			"uniforms": {
+				"GrainConfig": [
+					{
+						"name": "Strength",
+						"type": "float",
+						"value": 0.03
+					}
+				],
+				"RmlsGradeTuning": [
+					{
+						"name": "GradeStrength",
+						"type": "float",
+						"value": 1.0
+					}
+				],
+				"BloomGradeConfig": [
+					{
+						"name": "BloomStrength",
+						"type": "float",
+						"value": 0.32
+					}
+				],
+				"SpillGradeConfig": [
+					{
+						"name": "SpillStrength",
+						"type": "float",
+						"value": 0.35
+					}
+				]
+			}
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "bless:post/fxaa",
+			"inputs": [
+				{
+					"sampler_name": "In",
+					"target": "bless:scratch",
+					"bilinear": true
+				}
+			],
+			"output": "minecraft:main",
+			"uniforms": {
+				"FxaaConfig": [
+					{
+						"name": "FxaaSettings",
+						"type": "vec4",
+						"value": [ -1.0, 0.0, 0.0, 0.0 ]
+					}
+				]
+			}
+		}
+	]
+}

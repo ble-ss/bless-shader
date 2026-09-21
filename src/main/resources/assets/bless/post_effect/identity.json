@@ -1,0 +1,19 @@
+{
+	"targets": {},
+	"passes": [
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "minecraft:post/blit",
+			"inputs": [{"sampler_name": "In", "target": "minecraft:main", "bilinear": false}],
+			"output": "bless:scratch",
+			"uniforms": {"BlitConfig": [{"name": "ColorModulate", "type": "vec4", "value": [1.0, 1.0, 1.0, 1.0]}]}
+		},
+		{
+			"vertex_shader": "minecraft:core/screenquad",
+			"fragment_shader": "minecraft:post/blit",
+			"inputs": [{"sampler_name": "In", "target": "bless:scratch", "bilinear": false}],
+			"output": "minecraft:main",
+			"uniforms": {"BlitConfig": [{"name": "ColorModulate", "type": "vec4", "value": [1.0, 1.0, 1.0, 1.0]}]}
+		}
+	]
+}

@@ -1,0 +1,14 @@
+{
+	"schemaVersion": 1,
+	"id": "bless",
+	"version": "${version}",
+	"name": "bless",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["dev.bless.RmlsClient"],
+		"modmenu": ["dev.bless.ui.RmlsModMenu"]
+	},
+	"mixins": ["bless.mixins.json"],
+	"depends": {"fabricloader": ">=0.19.3", "minecraft": "26.2", "java": ">=25", "fabric-api": "*"},
+	"suggests": {"modmenu": ">=20.0.1"}
+}

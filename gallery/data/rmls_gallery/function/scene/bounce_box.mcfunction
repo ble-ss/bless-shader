@@ -1,0 +1,15 @@
+fill 48 60 -22 62 80 -7 minecraft:air
+fill 48 64 -22 62 64 -7 minecraft:white_concrete
+fill 48 78 -22 62 78 -8 minecraft:white_concrete
+fill 48 65 -22 48 77 -8 minecraft:white_concrete
+fill 62 65 -22 62 77 -8 minecraft:white_concrete
+fill 49 65 -22 61 77 -22 minecraft:white_concrete
+fill 49 65 -8 61 77 -8 minecraft:white_concrete
+fill 49 65 -21 49 77 -9 minecraft:red_concrete
+fill 61 65 -21 61 77 -9 minecraft:green_concrete
+fill 53 78 -17 57 78 -13 minecraft:glass
+fill 51 65 -18 53 70 -16 minecraft:white_concrete
+fill 56 65 -14 59 67 -11 minecraft:white_concrete
+fill 53 64 -7 56 68 -7 minecraft:white_concrete
+fill 54 65 -7 55 67 -7 minecraft:air
+fill 54 65 -8 55 67 -8 minecraft:air

@@ -1,0 +1,14 @@
+fill 0 60 -24 20 76 -7 minecraft:air
+fill 0 64 -24 20 64 -7 minecraft:polished_deepslate
+fill 0 73 -24 20 73 -7 minecraft:polished_deepslate
+fill 0 65 -23 0 72 -7 minecraft:glowstone
+fill 20 65 -23 20 72 -7 minecraft:sea_lantern
+fill 0 65 -24 20 72 -24 minecraft:polished_deepslate
+fill 9 65 -18 11 69 -16 minecraft:smooth_stone
+fill 6 65 -12 6 70 -12 minecraft:andesite
+fill 15 65 -20 15 69 -20 minecraft:polished_andesite
+fill 13 65 -12 16 65 -10 minecraft:stone_slab[type=top]
+fill 4 65 -21 6 67 -19 minecraft:cobblestone
+fill 14 65 -10 16 67 -8 minecraft:polished_diorite
+fill 8 65 -22 9 66 -21 minecraft:stone
+fill 11 65 -9 12 68 -9 minecraft:chiseled_stone_bricks

@@ -1,0 +1,7 @@
+{
+  "pack": {
+    "description": "rmls-client shader gallery - fifteen rooms of light",
+    "min_format": [107, 1],
+    "max_format": 107
+  }
+}

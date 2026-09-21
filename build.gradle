@@ -1,0 +1,53 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+version = '0.2.0'
+group = 'dev.bless'
+base { archivesName = 'bless' }
+repositories { mavenCentral() }
+
+// mod menu's own api jar, the way works compiles its optional sodium fast path: no maven artifact
+// resolves offline here, so this reads straight from the instance's mods folder -- the same jar
+// the mod runs beside at runtime. the settings screen's mod menu bridge (RmlsModMenu) is compile-only
+// against it and never required: fabric.mod.json lists modmenu as a suggestion, not a dependency.
+def tkInstance = System.getenv("TK_INSTANCE") ?:
+		"${System.getProperty('user.home')}/Library/Application Support/PrismLauncher/instances/26.2 ari mods lite/minecraft"
+def modmenuApiJars = fileTree(dir: "${tkInstance}/mods", include: "modmenu-*.jar")
+if (modmenuApiJars.isEmpty()) {
+	throw new GradleException("modmenu api jar not found under ${tkInstance}/mods; set TK_INSTANCE to a minecraft instance folder that contains modmenu-*.jar (bless compiles its optional settings-screen bridge against it; runtime never requires mod menu)")
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${loader_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${fabric_version}"
+	compileOnly modmenuApiJars
+}
+
+loom {
+	mods { bless { sourceSet sourceSets.main } }
+	runs {
+		client { runDir 'build/unused-client' }
+		server { runDir 'build/unused-server' }
+	}
+}
+
+// live validation belongs to the isolated benchmark runner.
+tasks.named('runClient') {
+	doFirst { throw new GradleException('stage the built client jar in the isolated benchmark runner') }
+}
+tasks.named('runServer') {
+	doFirst { throw new GradleException('bless is client-only') }
+}
+
+processResources {
+	inputs.property 'version', project.version
+	filesMatching('fabric.mod.json') { expand version: project.version }
+}
+tasks.withType(JavaCompile).configureEach { options.release = 25 }
+java {
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+	withSourcesJar()
+}

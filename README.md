@@ -9,7 +9,7 @@
 
 development happened on an apple m4, with measurements taken at every change. at 1920 by 1200 on that machine the full look runs about 5.5 ms per frame; per-effect costs are tabulated below.
 
-<img width="1920" height="1200" alt="image" src="https://github.com/user-attachments/assets/ae7f926f-daa4-4a2b-8bb0-9ba39dafdddf" />
+<img width="1920" alt="image" src="https://github.com/user-attachments/assets/ae7f926f-daa4-4a2b-8bb0-9ba39dafdddf" />
 
 
 ## what it does
@@ -33,17 +33,17 @@ development happened on an apple m4, with measurements taken at every change. at
 
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/01-light-dark.svg"> <img alt="light" src="design/readme/01-light-light.svg"> </picture>
 
-<img width="1920" height="1200" alt="image" src="https://github.com/user-attachments/assets/9b8f0d07-3c57-4821-8ffc-98b2e332b11f" />
+<img width="1920" alt="image" src="https://github.com/user-attachments/assets/9b8f0d07-3c57-4821-8ffc-98b2e332b11f" />
 
 
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/02-bounce-dark.svg"> <img alt="bounce" src="design/readme/02-bounce-light.svg"> </picture>
 
-<img width="1920" height="1200" alt="image" src="https://github.com/user-attachments/assets/6506b5c5-917b-46e7-ba5c-4a9b9a4a6c01" />
+<img width="1920" alt="image" src="https://github.com/user-attachments/assets/6506b5c5-917b-46e7-ba5c-4a9b9a4a6c01" />
 
 
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/03-glass-dark.svg"> <img alt="glass" src="design/readme/03-glass-light.svg"> </picture>
 
-<img width="1920" height="1200" alt="image" src="https://github.com/user-attachments/assets/693ca066-6dbd-4721-8149-eb19eedfd0df" />
+<img width="1920" alt="image" src="https://github.com/user-attachments/assets/693ca066-6dbd-4721-8149-eb19eedfd0df" />
 
 
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/04-water-dark.svg"> <img alt="water" src="design/readme/04-water-light.svg"> </picture>

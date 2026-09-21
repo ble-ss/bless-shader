@@ -1,13 +1,14 @@
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/header-dark.svg"> <img alt="bless in block type: a shader for minecraft 26.2, in fabric, on vulkan and opengl" src="design/readme/header-light.svg"> </picture>
 
-<!-- the two dynamic badges answer "repo not found" while this repo is private, and release needs a tag; uncomment them the day each is true. -->
+<!-- the release badge needs a tag; uncomment it the day v0.2.0 exists. -->
 
-![minecraft 26.2](https://img.shields.io/badge/minecraft-26.2-f2f2f2?style=flat-square&labelColor=000000) ![fabric](https://img.shields.io/badge/loader-fabric-f2f2f2?style=flat-square&labelColor=000000) ![java 25](https://img.shields.io/badge/java-25-f2f2f2?style=flat-square&labelColor=000000) ![vulkan and opengl](https://img.shields.io/badge/backends-vulkan%20%7C%20opengl-f2f2f2?style=flat-square&labelColor=000000) ![license mit](https://img.shields.io/badge/license-mit-f2f2f2?style=flat-square&labelColor=000000)
-<!-- ![last commit](https://img.shields.io/github/last-commit/ACCOUNT/bless-shader?style=flat-square&labelColor=000000&color=f2f2f2) ![release](https://img.shields.io/github/v/release/ACCOUNT/bless-shader?style=flat-square&labelColor=000000&color=f2f2f2) -->
+![minecraft 26.2](https://img.shields.io/badge/minecraft-26.2-f2f2f2?style=flat-square&labelColor=000000) ![vulkan](https://img.shields.io/badge/vulkan-moltenvk%20on%20macos-f2f2f2?style=flat-square&labelColor=000000) ![apple silicon](https://img.shields.io/badge/tuned%20on-apple%20m4-f2f2f2?style=flat-square&labelColor=000000) ![fabric](https://img.shields.io/badge/loader-fabric-f2f2f2?style=flat-square&labelColor=000000) ![java 25](https://img.shields.io/badge/java-25-f2f2f2?style=flat-square&labelColor=000000) ![vulkan and opengl](https://img.shields.io/badge/backends-vulkan%20%7C%20opengl-f2f2f2?style=flat-square&labelColor=000000) ![license mit](https://img.shields.io/badge/license-mit-f2f2f2?style=flat-square&labelColor=000000)
+![last commit](https://img.shields.io/github/last-commit/ble-ss/bless-shader?style=flat-square&labelColor=000000&color=f2f2f2)
+<!-- ![release](https://img.shields.io/github/v/release/ble-ss/bless-shader?style=flat-square&labelColor=000000&color=f2f2f2) -->
 
-`bless` does its shading as a fabric client mod rather than a shader pack, targeting minecraft 26.2. it renders inside the game's own render graph, which is why it can skip iris and optifine entirely and work on both vulkan and opengl. the feature set: coloured light, a path trace with two bounces across a voxel copy of the world, sun shadows, volumetric air, light passing through stained glass, reflections off water, metal and glass, rain-wet ground, and adaptive exposure. the mod menu screen exposes each effect as a toggle and each parameter as a slider, and nearly all of it responds live to F3+T.
+`bless` is a shader written for the vulkan backend of minecraft 26.2, as a fabric client mod rather than a shader pack. it draws inside the game's own render graph, so it needs no iris and no optifine, and it was built and tuned on a macbook: an apple m4, where vulkan runs through moltenvk and opengl stops at 4.1. that is the whole reason it exists in this shape. the effects a shader pack would need opengl 4.6 or a compute shader for, the two-bounce path trace, the volumetric air, the coloured light, are all fragment passes over the frame here, and they fit in about 5.5 ms on that laptop.
 
-development happened on an apple m4, with measurements taken at every change. at 1920 by 1200 on that machine the full look runs about 5.5 ms per frame; per-effect costs are tabulated below.
+what it draws: coloured light from every emitter, a path trace with two bounces through a voxel copy of the world, sun shadows with real shapes, volumetric air and sun rays, light through stained glass, reflections on water, metal and glass, rain-wet ground, and an eye that adapts. every effect is a switch and every knob a slider in the mod menu screen, and the colour knobs reload live with F3+T.
 
 <img width="1920" alt="image" src="https://github.com/user-attachments/assets/ae7f926f-daa4-4a2b-8bb0-9ba39dafdddf" />
 
@@ -53,15 +54,40 @@ tbd
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/05-air-dark.svg"> <img alt="air" src="design/readme/05-air-light.svg"> </picture>
 
 <img width="960" height="600" alt="image" src="https://github.com/user-attachments/assets/98bef70a-9f66-465a-b85c-7607292251af" />
-{higher res in game
 
 ## install
 
 1. minecraft 26.2 with fabric loader and fabric api. mod menu is optional; it adds the settings screen (there is also a keybind).
 2. drop `bless-0.2.0.jar` in `mods/`.
-3. put a `bless.json` in `config/`. the mod reads it once at startup, and a missing file means everything off. the release carries one with everything on.
-4. for the whole look, run the vulkan backend (video settings, graphics backend). on opengl you get the colour grade, bloom, grain and fxaa; the depth stage, everything from shadows to the bounce, is vulkan for now.
-5. on a mac, set fullscreen mode to borderless. exclusive fullscreen starts the vulkan window at half the panel's pixels and never resizes.
+3. launch once. the mod writes `config/bless.json` on its first run, with every effect on at the settings tuned on the m4, and reads it at every start after that. delete the file to get the defaults back.
+4. pick the vulkan backend in video settings (graphics backend). the whole look lives there. on opengl you get the colour chain alone: grade, bloom, spill, grain and fxaa. the depth stage, everything from shadows to the bounce, is vulkan only, because a mac's opengl ends at 4.1 and the passes need what vulkan gives them.
+5. on a mac, set fullscreen mode to borderless. exclusive fullscreen starts the vulkan window at half the panel's pixels and never resizes, and every half-resolution pass then works at a quarter of what it should.
+
+## on a macbook
+
+this is where bless was made and where its numbers come from: an apple m4 macbook, minecraft 26.2 on vulkan through moltenvk, a window of 1920 by 1200 pixels. every number is a gpu-time median over hundreds of frames from an isolated bench, not a screenshot of the fps counter.
+
+| heavy scene, 1920 by 1200 | gpu time per frame |
+|---|---|
+| no shader | 5.0 ms |
+| every effect on, at the shipped settings | 10.6 ms |
+
+so the full look costs about 5.5 ms a frame on an m4 and leaves the gpu at roughly 95 frames a second before anything else in the frame is counted. the shipped `bless.json` is the m4 tuning: the bounce at 2 rays and 16 blocks with the checkerboard on, the air at 10 steps, strength 0.6.
+
+what each effect costs there, in a torch-lit room:
+
+| effect | ms |
+|---|---|
+| the bounce, m4 settings | 1.3 |
+| the bounce, full defaults (4 rays, 24 blocks) | 5.1 |
+| the air | 0.5 |
+| glass light | 0.3 |
+| sun rays | 0.2 |
+| the eye | 0.1 |
+| wetness | under 0.1 |
+| fxaa | 0.05 |
+
+on an older or smaller mac, turn things off in this order and you keep most of the look: `voxel_gi` first, then `volumetric_light`, then `sun_shadows`. or keep the bounce and shrink it: `gi_scale` 3 or 4 traces at a third or a quarter of the frame, `gi_rays` 1, `gi_distance` 12. on a bigger card, the same knobs go the other way. the panel's native resolution was not measured; expect the half-resolution passes to scale with pixel count.
 
 ## settings
 
@@ -101,17 +127,6 @@ the mod ships with two data packs of vanilla blocks, there so each effect can be
 
 drop either folder into a superflat creative world's `datapacks/`, `/reload`, then `/function rmls_showcase:build` or `/function rmls_gallery:build`, and `/function rmls_showcase:go/<room>` or `/function rmls_gallery:go/<room>` to teleport to a room's viewpoint. the readme in each pack enumerates its rooms.
 
-## what it costs
-
-numbers taken on an apple m4 at 1920 by 1200 on vulkan, gpu time per frame, median across 900 frames of a heavy scene: a full room of mobs and blocks from the household mods.
-
-| | ms |
-|---|---|
-| no shader | 5.0 |
-| everything on | 10.6 |
-
-per effect, measured in a torch-lit room: the bounce at the m4 settings 1.3, the air 0.5, sun rays 0.2, glass light 0.3, wetness under 0.1, fxaa 0.05, the eye 0.1. at its full defaults (4 rays, 24 blocks) the bounce costs 5.1, and that is the budget a bigger card would put toward it.
-
 ## how it works
 
 two hooks into the game's frame graph. the first fires early, after opaque terrain and before the hand clears the depth buffer: a depth stage rebuilds positions and normals out of depth, then computes shadows, occlusion, reflections, the bounce and the air as half-resolution masks resolved across the frame. the second fires late and applies the colour chain as a post effect: grade, bloom, spill, grain, fxaa.
@@ -124,7 +139,7 @@ materials come from observation, not heuristics: scanning the loaded chunks prod
 
 ## building
 
-java 25, gradle wrapper, fabric loom. `./gradlew build` writes `build/libs/bless-0.2.0.jar`. the settings screen compiles against mod menu's jar found in a minecraft instance's `mods/` folder; point `TK_INSTANCE` at any instance that has one. the mod refuses `runClient`; the bench runs it in an isolated instance instead.
+java 25, gradle wrapper, fabric loom. `./gradlew build` writes `build/libs/bless-0.2.0.jar`. the settings screen compiles against mod menu's jar found in a minecraft instance's `mods/` folder; point `TK_INSTANCE` at any instance that has one. the mod refuses `runClient`; the bench runs it in an isolated instance instead. building needs no mac; running the depth stage needs vulkan.
 
 ## the bench
 

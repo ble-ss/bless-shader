@@ -230,6 +230,21 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 	}
 
 	public static ClientConfig read(Path path) throws IOException {
+		// a missing file used to mean everything off and no file written; a first launch then showed
+		// nothing at all and sent people hunting for a config. the jar carries the tuned config
+		// (assets/bless/default-config.json, the m4 candidate with every effect on): write it once,
+		// then read it like any other. if the copy fails the old silence stands.
+		if (!Files.exists(path)) {
+			try (var in = ClientConfig.class.getResourceAsStream("/assets/bless/default-config.json")) {
+				if (in != null) {
+					Files.createDirectories(path.getParent());
+					Files.copy(in, path);
+					RmlsClient.LOGGER.info("bless: wrote the default configuration to {}", path);
+				}
+			} catch (IOException e) {
+				RmlsClient.LOGGER.warn("bless: could not write the default configuration to {}: {}", path, e.toString());
+			}
+		}
 		if (!Files.exists(path)) return new ClientConfig("off", false, null,
 			DEFAULT_BLOOM_THRESHOLD, DEFAULT_BLOOM_STRENGTH, DEFAULT_GRADE_STRENGTH, DEFAULT_GRAIN_STRENGTH,
 			false, DEFAULT_FXAA_STRENGTH,

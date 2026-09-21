@@ -9,7 +9,7 @@
 
 development happened on an apple m4, with measurements taken at every change. at 1920 by 1200 on that machine the full look runs about 5.5 ms per frame; per-effect costs are tabulated below.
 
-<!-- SHOWCASE IMAGES: put your screenshots here, one per line, the chapel first. -->
+.
 
 ## what it does
 
@@ -32,23 +32,23 @@ development happened on an apple m4, with measurements taken at every change. at
 
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/01-light-dark.svg"> <img alt="light" src="design/readme/01-light-light.svg"> </picture>
 
-<!-- SHOWCASE IMAGE: coloured light, the lantern gallery or the colour doors -->
+.
 
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/02-bounce-dark.svg"> <img alt="bounce" src="design/readme/02-bounce-light.svg"> </picture>
 
-<!-- SHOWCASE IMAGE: the bounce room, or two suns -->
+.
 
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/03-glass-dark.svg"> <img alt="glass" src="design/readme/03-glass-light.svg"> </picture>
 
-<!-- SHOWCASE IMAGE: the stained chapel at noon -->
+.
 
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/04-water-dark.svg"> <img alt="water" src="design/readme/04-water-light.svg"> </picture>
 
-<!-- SHOWCASE IMAGE: the mirror pool, or rain -->
+.
 
 <picture> <source media="(prefers-color-scheme: dark)" srcset="design/readme/05-air-dark.svg"> <img alt="air" src="design/readme/05-air-light.svg"> </picture>
 
-<!-- SHOWCASE IMAGE: the fog gully at sunset -->
+.
 
 ## install
 

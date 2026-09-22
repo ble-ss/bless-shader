@@ -55,9 +55,12 @@ final class VoxelVolume {
 
 	// re-anchor once the camera leaves the middle third of the volume on an axis.
 	private static final int MARGIN_XZ = SIZE_X / 6;
-	private static final long REBUILD_INTERVAL_NANOS = 2_000_000_000L;
-	private static final long SNAPSHOT_BUDGET_NANOS = 1_500_000L;
 	private static final int TIME_CHECK_STRIDE = 512;
+	// rmls-cost brief item 1: the two constants above used to be fixed (2 s rebuild floor, 1.5 ms
+	// snapshot budget) -- both are now knobs, read live from config each tick (DepthEffects.render's
+	// own volume.tick call site), same volatile-field shape as glassLight/glassTintStrength below.
+	volatile float voxelBudgetMs = 1.0f;
+	volatile float voxelRebuildSeconds = 2f;
 
 	private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
 		Thread thread = new Thread(runnable, "bless-voxel-volume");
@@ -98,16 +101,34 @@ final class VoxelVolume {
 	// index-only (no colour key: two fluid emitters sharing a cell are overwhelmingly the same block,
 	// same colour). reused across fills, cleared instead of reallocated.
 	private static final int CELL_SIZE = 5;
-	private static final int CELLS_X = (SIZE_X + CELL_SIZE - 1) / CELL_SIZE;
-	private static final int CELLS_Y = (SIZE_Y + CELL_SIZE - 1) / CELL_SIZE;
-	private static final int CELLS_Z = (SIZE_Z + CELL_SIZE - 1) / CELL_SIZE;
+	// rmls-cost brief item 3: sized for CELL_SIZE_CROWDED (3, the finer grid) since that yields the
+	// larger quotient range -- the coarser fluid-only grid (CELL_SIZE, 5) still indexes into the same
+	// BitSet fine at those strides, it just never reaches the far end of them.
+	private static final int CELLS_X = (SIZE_X + 2) / 3;
+	private static final int CELLS_Y = (SIZE_Y + 2) / 3;
+	private static final int CELLS_Z = (SIZE_Z + 2) / 3;
 	private BitSet thinnedCells;
 	// leak-repairs item 4a: a snapshot with an unbounded lava sea in it produced hundreds of thousands
-	// of emitters, each running its own flood -- keep only the MAX_EMITTERS nearest the volume centre.
-	private static final int MAX_EMITTERS = 4096;
+	// of emitters, each running its own flood -- keep only the nearest voxelEmitterCap to the volume
+	// centre. rmls-cost brief item 3: this used to be a fixed 4096; now a live knob, default 1024.
+	volatile int voxelEmitterCap = 1024;
+	// rmls-cost brief item 3: the fluid-only 5x5x5 thinning below still applies at any emitter count,
+	// but once the raw count exceeds voxelEmitterCap every emitter (not just fluids) also gets thinned,
+	// at the finer 3x3x3 grid -- a village of candles is otherwise hundreds of same-brightness floods a
+	// block or two apart. CELLS_X/Y/Z below are sized for the finer grid (3) since that yields the
+	// larger cell-count; the coarser fluid-only grid (5) still indexes into the same BitSet fine, just
+	// leaving most of it unused (a smaller quotient range).
+	private static final int CELL_SIZE_FLUID = CELL_SIZE;
+	private static final int CELL_SIZE_CROWDED = 3;
 
 	private long rebuilds, lastEmitters, lastFillNanos, lastSnapshotNanos, lastOccluders, lastFilters;
-	private long voxelFillSkips, emittersDroppedTotal;
+	private long voxelFillSkips, emittersDroppedTotal, voxelRebuildsSkippedStill;
+	// rmls-cost brief item 1b: the adaptive interval maybeStartRebuild last computed, for status only.
+	private long lastComputedIntervalNanos = 2_000_000_000L;
+	// rmls-cost brief item 1c: the camera position (block-grained; cameraBlock is already that coarse)
+	// at the start of the last snapshot actually taken -- compared against on every subsequent
+	// maybeStartRebuild call to decide the "camera barely moved" half of the still-room skip.
+	private double lastSnapshotCameraX, lastSnapshotCameraY, lastSnapshotCameraZ;
 	// glass-light brief: set by DepthEffects every tick from config, read when a new Snapshot starts
 	// (record() decides FLAG_FILTER at scan time) and by fill() (the flood's own tint lerp) -- plain
 	// volatile fields rather than a config reference so this class stays decoupled from ClientConfig,
@@ -134,6 +155,8 @@ final class VoxelVolume {
 	double lastSnapshotMillis() { return lastSnapshotNanos / 1_000_000.0; }
 	long voxelFillSkips() { return voxelFillSkips; }
 	long emittersDropped() { return emittersDroppedTotal; }
+	long voxelRebuildsSkippedStill() { return voxelRebuildsSkippedStill; }
+	double voxelIntervalMillis() { return lastComputedIntervalNanos / 1_000_000.0; }
 
 	// leak-repairs item 1: RmlsClient's level-change hook. the in-flight snapshot (and any finished-
 	// but-undrained result) belong to the level the player just left; drop them and invalidate the
@@ -152,7 +175,7 @@ final class VoxelVolume {
 		ensureTextures();
 		drainCompleted();
 		if (building == null) maybeStartRebuild(level, cameraBlock);
-		else building.resume(SNAPSHOT_BUDGET_NANOS);
+		else building.resume((long) (voxelBudgetMs * 1_000_000f));
 		if (building != null && building.done()) {
 			Snapshot finished = building;
 			building = null;
@@ -184,7 +207,13 @@ final class VoxelVolume {
 			|| Math.abs(cellX - (displayOrigin.x() + SIZE_X / 2)) > MARGIN_XZ
 			|| Math.abs(cellZ - (displayOrigin.z() + SIZE_Z / 2)) > MARGIN_XZ
 			|| Math.abs(cellY - (displayOrigin.y() + SIZE_Y / 2)) > 16;
-		boolean timerDue = now - lastRebuildStart >= REBUILD_INTERVAL_NANOS;
+		// rmls-cost brief item 1b: the fixed 2 s floor used to be REBUILD_INTERVAL_NANOS -- a snapshot
+		// costing 250 ms of render-thread time then still rebuilt every 2 s regardless, wasting most of
+		// that budget on a big-world scan. the interval now floors at voxelRebuildSeconds but stretches
+		// to 3x the last snapshot's own cost plus its fill cost, so a slow world self-throttles.
+		long intervalNanos = Math.max((long) (voxelRebuildSeconds * 1_000_000_000L), 3 * lastSnapshotNanos + lastFillNanos);
+		lastComputedIntervalNanos = intervalNanos;
+		boolean timerDue = now - lastRebuildStart >= intervalNanos;
 		// chunksDirty flips on every nearby block change and must not itself force a rebuild -- it only
 		// rides the next one once the interval has elapsed. anchorStale still jumps the queue.
 		if (!anchorStale && !timerDue) return;
@@ -193,8 +222,24 @@ final class VoxelVolume {
 		// a fill running long (a lava sea's flood, before item 4) piled up snapshots faster than the
 		// worker could drain them. skip and count instead; the next call (still every frame) retries.
 		if (fillInFlight.get()) { voxelFillSkips++; return; }
+		// rmls-cost brief item 1c: a due timer alone is not reason enough -- if the camera has barely
+		// moved (under 4 blocks) since the last snapshot AND no chunk has loaded or unloaded since
+		// (chunksDirty), nothing in the volume could plausibly have changed. standing still in a lit
+		// room now costs nothing beyond this cheap check. anchorStale still always proceeds: it means
+		// the volume itself needs to re-anchor, not merely that the timer elapsed.
+		if (!anchorStale) {
+			double dx = cameraBlock.getX() - lastSnapshotCameraX, dy = cameraBlock.getY() - lastSnapshotCameraY, dz = cameraBlock.getZ() - lastSnapshotCameraZ;
+			if (dx * dx + dy * dy + dz * dz < 16.0 && !chunksDirty) {
+				voxelRebuildsSkippedStill++;
+				lastRebuildStart = now; // defer the next check by a full interval; nothing here to redo sooner
+				return;
+			}
+		}
 		chunksDirty = false;
 		lastRebuildStart = now;
+		lastSnapshotCameraX = cameraBlock.getX();
+		lastSnapshotCameraY = cameraBlock.getY();
+		lastSnapshotCameraZ = cameraBlock.getZ();
 		int originX = Math.floorDiv(cameraBlock.getX(), 16) * 16 - SIZE_X / 2;
 		int originY = Math.floorDiv(cameraBlock.getY(), 16) * 16 - SIZE_Y / 2;
 		int originZ = Math.floorDiv(cameraBlock.getZ(), 16) * 16 - SIZE_Z / 2;
@@ -260,19 +305,26 @@ final class VoxelVolume {
 			int emitterTotal = snapshot.emitterLevel.size();
 			// leak-repairs item 4a: a lava sea can leave this snapshot with hundreds of thousands of
 			// level-15 emitters, each about to run its own flood below -- keep only the nearest
-			// MAX_EMITTERS to the volume centre.
-			int[] emitterOrder = selectEmitters(snapshot, emitterTotal);
+			// voxelEmitterCap to the volume centre.
+			int emitterCap = Math.max(1, voxelEmitterCap);
+			int[] emitterOrder = selectEmitters(snapshot, emitterTotal, emitterCap);
 			int emittersDropped = emitterTotal - emitterOrder.length;
+			// rmls-cost brief item 3: over the cap, every emitter (not only fluids) gets thinned, at the
+			// finer 3x3x3 grid -- a village of candles is otherwise hundreds of same-brightness floods a
+			// block or two apart even after the distance cap above already trimmed the far ones.
+			boolean crowded = emitterTotal > emitterCap;
+			int thinCellSize = crowded ? CELL_SIZE_CROWDED : CELL_SIZE_FLUID;
 			for (int order = 0; order < emitterOrder.length; order++) {
 				int e = emitterOrder[order];
 				int ex = snapshot.emitterX.getInt(e), ey = snapshot.emitterY.getInt(e), ez = snapshot.emitterZ.getInt(e);
 				int startIndex = snapshot.index(ex, ey, ez);
-				// leak-repairs item 4b: thin fluid (lava) emitters to one seed per 5x5x5 cell -- a lava
-				// sea's surface is otherwise thousands of same-colour emitters a block apart, each
-				// queuing a flood that mostly re-covers ground its neighbours already lit.
+				// leak-repairs item 4b: thin fluid (lava) emitters to one seed per cell -- a lava sea's
+				// surface is otherwise thousands of same-colour emitters a block apart, each queuing a
+				// flood that mostly re-covers ground its neighbours already lit. rmls-cost brief item 3:
+				// once crowded, every emitter is thinned this way, not only fluids.
 				boolean fluidEmitter = (snapshot.voxels[startIndex * 4 + 3] & FLAG_FLUID) != 0;
-				if (fluidEmitter) {
-					int cellIndex = ((ex / CELL_SIZE) * CELLS_Y + (ey / CELL_SIZE)) * CELLS_Z + (ez / CELL_SIZE);
+				if (fluidEmitter || crowded) {
+					int cellIndex = ((ex / thinCellSize) * CELLS_Y + (ey / thinCellSize)) * CELLS_Z + (ez / thinCellSize);
 					if (thinnedCells.get(cellIndex)) continue;
 					thinnedCells.set(cellIndex);
 				}
@@ -340,10 +392,12 @@ final class VoxelVolume {
 		}
 	}
 
-	/** leak-repairs item 4a: indices into snapshot's emitter lists, nearest MAX_EMITTERS to the volume
-	 * centre when there are more than that many, otherwise every emitter unordered. worker thread only. */
-	private static int[] selectEmitters(Snapshot snapshot, int emitterTotal) {
-		if (emitterTotal <= MAX_EMITTERS) {
+	/** leak-repairs item 4a: indices into snapshot's emitter lists, nearest `cap` to the volume centre
+	 * when there are more than that many, otherwise every emitter unordered. worker thread only.
+	 * rmls-cost brief item 3: cap is now voxelEmitterCap, read once per fill by the caller, not a
+	 * fixed constant. */
+	private static int[] selectEmitters(Snapshot snapshot, int emitterTotal, int cap) {
+		if (emitterTotal <= cap) {
 			int[] all = new int[emitterTotal];
 			for (int i = 0; i < emitterTotal; i++) all[i] = i;
 			return all;
@@ -357,8 +411,8 @@ final class VoxelVolume {
 			distSq[i] = dx * dx + dy * dy + dz * dz;
 		}
 		Arrays.sort(order, (a, b) -> Double.compare(distSq[a], distSq[b]));
-		int[] kept = new int[MAX_EMITTERS];
-		for (int i = 0; i < MAX_EMITTERS; i++) kept[i] = order[i];
+		int[] kept = new int[cap];
+		for (int i = 0; i < cap; i++) kept[i] = order[i];
 		return kept;
 	}
 

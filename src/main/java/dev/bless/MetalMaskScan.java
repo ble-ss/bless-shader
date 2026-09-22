@@ -49,9 +49,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * on grass; the mask this scan feeds is drawn as real geometry instead, so the shader can just look.
  */
 final class MetalMaskScan {
-	private static final long FRAME_BUDGET_NANOS = 500_000L; // 0.5 ms
 	private static final int Y_WINDOW_BLOCKS = 48;
 	private static final int TIME_CHECK_STRIDE = 256; // (x,z) columns (16 y-reads each) between clock checks
+	// rmls-cost brief item 2a: the fixed 0.5 ms budget is now a knob, read live from config
+	// (DepthEffects.updateMetalGeometry, same volatile-write-before-use shape as VoxelVolume's own
+	// glassLight/voxelBudgetMs fields) -- default halved from the old constant (0.5 -> 0.25 ms).
+	volatile float materialBudgetMs = 0.25f;
+	private long frameBudgetNanos() { return (long) (materialBudgetMs * 1_000_000f); }
 
 	// per chunk, per section (blockY >> 4): the reflective positions found in that section.
 	private final Map<Long, Map<Integer, long[]>> chunkSections = new ConcurrentHashMap<>();
@@ -152,7 +156,7 @@ final class MetalMaskScan {
 	 * one frame; this still only ever spends the one shared budget. */
 	void refresh(ClientLevel level, BlockPos cameraPos, long gameTime) {
 		evictFarChunks(cameraPos);
-		long deadline = System.nanoTime() + FRAME_BUDGET_NANOS;
+		long deadline = System.nanoTime() + frameBudgetNanos();
 		if (drainPending(level, cameraPos, deadline)) return; // pending work ate the whole budget
 		long remaining = deadline - System.nanoTime();
 		if (remaining <= 0) return;
@@ -290,10 +294,14 @@ final class MetalMaskScan {
 	}
 
 	// item 2: positionsNear used to sort every tracked position in range, one 30 ms spike traced to
-	// it -- gather only from chunks within CHUNK_GATHER_RADIUS chebyshev chunks of the camera first
-	// (a plain map lookup per chunk, same key shape onLoad/onUnload already use), and sort only when
-	// that gather actually exceeds `limit`; otherwise the gathered set is small enough to take whole.
-	private static final int CHUNK_GATHER_RADIUS = 4; // chunks, chebyshev -- covers the 64-block range below
+	// it -- gather only from chunks within chebyshev range of the camera first (a plain map lookup per
+	// chunk, same key shape onLoad/onUnload already use), and sort only when that gather actually
+	// exceeds `limit`; otherwise the gathered set is small enough to take whole.
+	// rmls-cost brief item 2b: with 21598 water surfaces in range the gather itself was the cost, not
+	// the sort -- a fixed radius-4 square (81 chunks) walked every chunk whether or not it had already
+	// found `limit` positions. now walks chunks ring by ring outward from the camera's own chunk and
+	// stops the moment `limit` positions have been found within range -- nearest chunks first is nearly
+	// nearest-first, good enough for a mask that gets re-sorted below anyway when it overshoots.
 
 	/** nearest-first positions within range of the camera, capped at limit (brief item 3: 4096). */
 	List<BlockPos> positionsNear(Vec3 camera, double range, int limit) {
@@ -319,18 +327,28 @@ final class MetalMaskScan {
 		double rangeSq = range * range;
 		int centerChunkX = ((int) Math.floor(camera.x())) >> 4;
 		int centerChunkZ = ((int) Math.floor(camera.z())) >> 4;
+		// enough rings to cover `range` fully (range/16 chunks) plus one for the camera's own offset
+		// inside its chunk -- a ring walk that stopped short of this would silently under-report.
+		int maxRadius = (int) Math.ceil(range / 16.0) + 1;
 		List<BlockPos> found = new ArrayList<>();
-		for (int chunkX = centerChunkX - CHUNK_GATHER_RADIUS; chunkX <= centerChunkX + CHUNK_GATHER_RADIUS; chunkX++) {
-			for (int chunkZ = centerChunkZ - CHUNK_GATHER_RADIUS; chunkZ <= centerChunkZ + CHUNK_GATHER_RADIUS; chunkZ++) {
-				Map<Integer, long[]> sections = sectionsMap.get(ChunkPos.pack(chunkX, chunkZ));
-				if (sections == null) continue;
-				for (long[] positions : sections.values())
-					for (long packed : positions) {
-						BlockPos pos = BlockPos.of(packed);
-						double distanceSq = pos.distToCenterSqr(camera.x(), camera.y(), camera.z());
-						if (distanceSq <= rangeSq) found.add(pos);
-					}
+		ringSearch:
+		for (int radius = 0; radius <= maxRadius; radius++) {
+			for (int chunkX = centerChunkX - radius; chunkX <= centerChunkX + radius; chunkX++) {
+				for (int chunkZ = centerChunkZ - radius; chunkZ <= centerChunkZ + radius; chunkZ++) {
+					// only the ring's own perimeter -- interior chunks at this radius were already
+					// walked by an earlier, smaller radius.
+					if (Math.max(Math.abs(chunkX - centerChunkX), Math.abs(chunkZ - centerChunkZ)) != radius) continue;
+					Map<Integer, long[]> sections = sectionsMap.get(ChunkPos.pack(chunkX, chunkZ));
+					if (sections == null) continue;
+					for (long[] positions : sections.values())
+						for (long packed : positions) {
+							BlockPos pos = BlockPos.of(packed);
+							double distanceSq = pos.distToCenterSqr(camera.x(), camera.y(), camera.z());
+							if (distanceSq <= rangeSq) found.add(pos);
+						}
+				}
 			}
+			if (found.size() >= limit) break ringSearch;
 		}
 		if (found.size() > limit) {
 			found.sort(Comparator.comparingDouble(pos -> pos.distToCenterSqr(camera.x(), camera.y(), camera.z())));

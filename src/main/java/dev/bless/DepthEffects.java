@@ -141,6 +141,15 @@ final class DepthEffects {
 	// metalGeometryValid) is exempt so startup is not delayed by this floor.
 	private static final long METAL_REBUILD_MIN_INTERVAL_MILLIS = 250L;
 	private long lastMetalRebuildMillis = -1;
+	// rmls-cost brief item 2c: a cache miss used to rebuild all four kinds (metal, water, glass incl.
+	// its tint twin, panes incl. both its buffers) in the same frame -- spread across four consecutive
+	// frames instead, one kind per frame, so a 16-block move costs a quarter of the old spike each
+	// frame it lands on. -1 is idle (no rotation in progress); 0..3 names the next phase to run.
+	// metalGeometryValid/lastMetalScanRevision/lastMetalCameraPos/lastMetalRebuildMillis are only
+	// updated once the whole rotation completes -- mid-rotation frames keep drawing whichever buffers
+	// are already built, stale ones included, same as a plain cache hit would.
+	private static final int PHASE_METAL = 0, PHASE_WATER = 1, PHASE_GLASS = 2, PHASE_PANES = 3, PHASE_COUNT = 4;
+	private int metalRebuildPhase = -1;
 	// item 4: wall-clock cost of the per-frame metal path (the scan's own budgeted resume plus,
 	// on a cache miss, the nearest-4096 query and vertex buffer rebuild) -- last and peak.
 	private volatile long lastMetalTickMicros, maxMetalTickMicros;
@@ -296,9 +305,10 @@ final class DepthEffects {
 	// item 3: the scan's cursor always resumes (its own budgeted work), but the nearest-4096 query
 	// and the cube/quad vertex buffers it feeds are rebuilt only on a cache miss -- the scan reported
 	// a changed chunk (revision) or the camera moved more than 16 blocks since the buffers now held
-	// were built. a hit is a field read plus two cheap comparisons; a miss pays what this used to pay
-	// every frame. one scan feeds both masks (MetalMaskScan.refresh walks metal and water surfaces
-	// together), so metal and water buffers share this one cache trigger.
+	// were built. a hit is a field read plus two cheap comparisons. one scan feeds both masks
+	// (MetalMaskScan.refresh walks metal and water surfaces together), so metal and water buffers
+	// share this one cache trigger. rmls-cost brief item 2c: a miss no longer pays for all four kinds
+	// in the frame that noticed it -- see metalRebuildPhase and runMetalRebuildPhase below.
 	private void updateMetalGeometry(DepthFrameInputs.Frame frame) {
 		// glass-light brief item 3: frame.reflections() means "water_reflections on and not
 		// underwater" (DepthFrameInputs), unrelated to glass_light -- a glassLight-only player must not
@@ -315,13 +325,38 @@ final class DepthEffects {
 			closePaneMaskVertexBuffer();
 			closePaneTintVertexBuffer();
 			metalGeometryValid = false;
+			metalRebuildPhase = -1;
 			return;
 		}
 		var level = Minecraft.getInstance().level;
 		if (level == null) return;
 		var camera = frame.cameraPosition();
 		long tickStart = System.nanoTime();
+		metalScan.materialBudgetMs = config.materialBudgetMs();
 		metalScan.refresh(level, BlockPos.containing(camera), frame.gameTime());
+		// rmls-cost brief item 2c: a rotation already in progress runs to completion regardless of new
+		// triggers landing mid-way -- finishing what was started keeps the phase count honest and never
+		// leaves a buffer more than one rotation stale.
+		if (metalRebuildPhase >= 0) {
+			runMetalRebuildPhase(metalRebuildPhase, level, camera);
+			metalRebuildPhase++;
+			if (metalRebuildPhase >= PHASE_COUNT) {
+				metalRebuildPhase = -1;
+				lastMetalRebuildMillis = System.currentTimeMillis();
+				lastMetalScanRevision = metalScan.revision();
+				lastMetalCameraPos = camera;
+				metalGeometryValid = true;
+				// repair 2026-09-21 item 8: a newly placed (or broken) window's tint geometry just changed,
+				// but the shadow map itself is cached against sun angle -- without this it would not
+				// redraw, and so not re-tint, until the sun next moved. ask for one redraw on the very next
+				// shadow pass. fired once the rotation actually finishes, not on every one of its four
+				// frames -- a request, not a cleared drawn flag (the resolve gates on shadowMapDrawn, and
+				// clearing it here skipped the resolve for a frame on every geometry rebuild).
+				shadowRedrawRequested = true;
+			}
+			recordMetalTickMicros(tickStart);
+			return;
+		}
 		long revision = metalScan.revision();
 		boolean cameraMoved = !metalGeometryValid || camera.distanceTo(lastMetalCameraPos) > 16.0;
 		boolean revisionChanged = revision != lastMetalScanRevision;
@@ -334,22 +369,27 @@ final class DepthEffects {
 			recordMetalTickMicros(tickStart);
 			return; // rate-limited: a revision/camera trigger landed inside the 250 ms floor
 		}
-		lastMetalRebuildMillis = now;
-		lastMetalScanRevision = revision;
-		lastMetalCameraPos = camera;
-		metalGeometryValid = true;
-		rebuildMetalVertexBuffer(camera);
-		rebuildWaterVertexBuffer(camera);
-		rebuildGlassVertexBuffer(camera);
-		rebuildGlassTintVertexBuffer(level, camera);
-		rebuildPaneVertexBuffers(level, camera);
-		// repair 2026-09-21 item 8: a newly placed (or broken) window's tint geometry just changed, but
-		// the shadow map itself is cached against sun angle -- without this it would not redraw, and
-		// so not re-tint, until the sun next moved. ask for one redraw on the very next shadow pass.
-		// a request, not a cleared drawn flag: the resolve gates on shadowMapDrawn, and clearing it
-		// here skipped the resolve for a frame on every geometry rebuild (66 dark frames in a run).
-		shadowRedrawRequested = true;
+		// start a fresh four-frame rotation: this frame pays for phase 0 only, the rest follow above.
+		metalRebuildPhase = PHASE_METAL;
+		runMetalRebuildPhase(metalRebuildPhase, level, camera);
+		metalRebuildPhase++;
 		recordMetalTickMicros(tickStart);
+	}
+
+	// rmls-cost brief item 2c: one quarter of what updateMetalGeometry's cache-miss branch used to do
+	// in one frame -- metal and water are each their own positionsNear query, glass folds its coloured
+	// tint twin in (same glassPositionsNear query, brief calls them one "kind"), panes builds both its
+	// buffers from one panePositionsNear query the same way.
+	private void runMetalRebuildPhase(int phase, net.minecraft.client.multiplayer.ClientLevel level, net.minecraft.world.phys.Vec3 camera) {
+		switch (phase) {
+			case PHASE_METAL -> rebuildMetalVertexBuffer(camera);
+			case PHASE_WATER -> rebuildWaterVertexBuffer(camera);
+			case PHASE_GLASS -> {
+				rebuildGlassVertexBuffer(camera);
+				rebuildGlassTintVertexBuffer(level, camera);
+			}
+			case PHASE_PANES -> rebuildPaneVertexBuffers(level, camera);
+		}
 	}
 
 	private void closeMetalVertexBuffer() {
@@ -409,9 +449,13 @@ final class DepthEffects {
 	private void rebuildWaterVertexBuffer(net.minecraft.world.phys.Vec3 camera) {
 		closeWaterVertexBuffer();
 		if (!config.waterReflections()) return;
-		// water covers whole lakes and seas: 64 blocks and 4096 quads cut an ocean off in a visible ring, so the
-		// water side reaches 96 blocks and keeps 24576 quads (2.6 mb of vertices, rebuilt only on a cache miss).
-		var positions = metalScan.waterPositionsNear(camera, 96.0, 24576);
+		// rmls-cost brief item 2d: this used to reach 96 blocks and keep 24576 quads on the theory that
+		// an ocean deserves more reach than a metal cube -- but a mask past 64 blocks reads as half-
+		// resolution mush anyway (the reflection ray march itself does not go further), and on rori's
+		// live world 21598 tracked water surfaces made the gather this asked for the real cost. 64
+		// blocks and 8192 quads (still double metal/glass's own 4096-cube cap, water still covers more
+		// ground per position than a cube does) cuts both the gather and the vertex upload down.
+		var positions = metalScan.waterPositionsNear(camera, 64.0, 8192);
 		if (positions.isEmpty()) return;
 		ByteBuffer data = MemoryUtil.memAlloc(positions.size() * WATER_QUAD_OFFSETS.length * 4);
 		try {
@@ -667,6 +711,10 @@ final class DepthEffects {
 				// when glass_light is off (record() only reads glassLight, never glassTintStrength alone).
 				volume.glassLight = config.glassLight();
 				volume.glassTintStrength = config.glassTintStrength();
+				// rmls-cost brief item 1: three more live knobs, same volatile-write-before-tick shape.
+				volume.voxelBudgetMs = config.voxelBudgetMs();
+				volume.voxelRebuildSeconds = config.voxelRebuildSeconds();
+				volume.voxelEmitterCap = config.voxelEmitterCap();
 				if (client.level != null) volume.tick(client.level, camera.blockPos);
 			}
 			// sun shadows: budgets meshing work and uploads finished sections every frame the
@@ -1539,6 +1587,9 @@ final class DepthEffects {
 		result.put("light_volume_fill_ms", volume == null ? null : volume.lastFillMillis());
 		result.put("metal_reflections", config.metalReflections());
 		result.put("metal_strength", config.metalStrength());
+		// rmls-cost brief item 4: the material scan's own frame budget, beside the tracked-block
+		// counters it governs the cost of -- shared by metal, water, glass and pane tracking alike.
+		result.put("material_budget_ms", config.materialBudgetMs());
 		result.put("metal_blocks_tracked", metalScan.trackedBlocks());
 		result.put("metal_blocks_drawn", metalBlocksDrawnTotal);
 		result.put("metal_executed_frames", metalExecutedFrames);
@@ -1626,6 +1677,12 @@ final class DepthEffects {
 		result.put("voxel_volume_snapshot_ms", volume == null ? null : volume.lastSnapshotMillis());
 		result.put("voxel_fill_skips", volume == null ? 0 : volume.voxelFillSkips());
 		result.put("voxel_emitters_dropped", volume == null ? 0 : volume.emittersDropped());
+		// rmls-cost brief item 4: the three new voxel knobs beside the counters they govern.
+		result.put("voxel_budget_ms", config.voxelBudgetMs());
+		result.put("voxel_rebuild_seconds", config.voxelRebuildSeconds());
+		result.put("voxel_emitter_cap", config.voxelEmitterCap());
+		result.put("voxel_rebuilds_skipped_still", volume == null ? 0 : volume.voxelRebuildsSkippedStill());
+		result.put("voxel_interval_ms", volume == null ? null : volume.voxelIntervalMillis());
 		result.put("diagnostic_only", config.diagnosticOnly());
 		result.put("depth_diagnostic", config.depthDiagnostic());
 		result.put("backend", backend);

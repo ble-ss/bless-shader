@@ -26,7 +26,8 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 	int giScale, boolean giCheckerboard, float giEmissive,
 	boolean volumetricLight, float volumeStrength, float volumeDensity, int volumeSteps, float volumeDistance, float volumeGlow,
 	boolean sunRays, float sunRaysStrength,
-	boolean wetness, float wetStrength, float wetDrySeconds) {
+	boolean wetness, float wetStrength, float wetDrySeconds,
+	float voxelBudgetMs, float voxelRebuildSeconds, float materialBudgetMs, int voxelEmitterCap) {
 	private static final Set<String> KEYS = Set.of("schema_version", "mode", "grain", "diagnostics_path",
 		"bloom_threshold", "bloom_strength", "grade_strength", "grain_strength",
 		"fxaa", "fxaa_strength",
@@ -45,7 +46,8 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 		"voxel_gi", "gi_strength", "gi_rays", "gi_distance", "gi_sky", "gi_bounces", "gi_scale", "gi_checkerboard", "gi_emissive",
 		"volumetric_light", "volume_strength", "volume_density", "volume_steps", "volume_distance", "volume_glow",
 		"sun_rays", "sun_rays_strength",
-		"wetness", "wet_strength", "wet_dry_seconds");
+		"wetness", "wet_strength", "wet_dry_seconds",
+		"voxel_budget_ms", "voxel_rebuild_seconds", "material_budget_ms", "voxel_emitter_cap");
 	// today's baked numbers; a config missing these keys renders identically to before the knobs existed.
 	private static final float DEFAULT_BLOOM_THRESHOLD = 0.80f;
 	private static final float DEFAULT_BLOOM_STRENGTH = 0.32f;
@@ -144,6 +146,17 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 	// the seconds knob is how long a dry-out takes once the rain stops.
 	private static final float DEFAULT_WET_STRENGTH = 0.7f;
 	private static final float DEFAULT_WET_DRY_SECONDS = 60.0f;
+	// rmls-cost brief: the render-thread cost knobs -- a big, built-up world (rori's live status:
+	// voxel_volume_snapshot_ms 252, light_volume_fill_ms 55 with 552 emitters, metal_tick_micros_p95
+	// 1808) needs these tighter than the bench fixture's own numbers ever forced. voxel_budget_ms is
+	// VoxelVolume's per-frame render-thread scan budget (was a fixed 1.5 ms); voxel_rebuild_seconds is
+	// the floor of its adaptive rebuild interval (was a fixed 2 s); material_budget_ms is
+	// MetalMaskScan's per-frame chunk-tag scan budget (was a fixed 0.5 ms); voxel_emitter_cap is how
+	// many of the voxel volume's nearest light emitters get their own flood fill (was a fixed 4096).
+	private static final float DEFAULT_VOXEL_BUDGET_MS = 1.0f;
+	private static final float DEFAULT_VOXEL_REBUILD_SECONDS = 2.0f;
+	private static final float DEFAULT_MATERIAL_BUDGET_MS = 0.25f;
+	private static final int DEFAULT_VOXEL_EMITTER_CAP = 1024;
 	private static final java.util.regex.Pattern HEX_COLOR = java.util.regex.Pattern.compile("^#[0-9a-fA-F]{6}$");
 
 	// the one table every knob's range, default and screen label come from -- the reader below
@@ -220,7 +233,11 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 		new OptionSpec("sun_rays_strength", Kind.FLOAT, 0.0f, 3.0f, DEFAULT_SUN_RAYS_STRENGTH, "sun ray strength", "depth"),
 		new OptionSpec("wetness", Kind.BOOLEAN, 0, 1, 0, "rain wetness", "depth"),
 		new OptionSpec("wet_strength", Kind.FLOAT, 0.0f, 1.0f, DEFAULT_WET_STRENGTH, "wetness strength", "depth"),
-		new OptionSpec("wet_dry_seconds", Kind.FLOAT, 5.0f, 300.0f, DEFAULT_WET_DRY_SECONDS, "wetness dry-out seconds", "depth"));
+		new OptionSpec("wet_dry_seconds", Kind.FLOAT, 5.0f, 300.0f, DEFAULT_WET_DRY_SECONDS, "wetness dry-out seconds", "depth"),
+		new OptionSpec("voxel_budget_ms", Kind.FLOAT, 0.25f, 4.0f, DEFAULT_VOXEL_BUDGET_MS, "voxel volume frame budget", "depth"),
+		new OptionSpec("voxel_rebuild_seconds", Kind.FLOAT, 1.0f, 30.0f, DEFAULT_VOXEL_REBUILD_SECONDS, "voxel volume rebuild floor", "depth"),
+		new OptionSpec("material_budget_ms", Kind.FLOAT, 0.1f, 2.0f, DEFAULT_MATERIAL_BUDGET_MS, "material scan frame budget", "depth"),
+		new OptionSpec("voxel_emitter_cap", Kind.INT, 256, 4096, DEFAULT_VOXEL_EMITTER_CAP, "voxel volume emitter cap", "depth"));
 	private static final java.util.Map<String, OptionSpec> BY_KEY = OPTIONS.stream()
 		.collect(java.util.stream.Collectors.toMap(OptionSpec::key, spec -> spec));
 	static OptionSpec spec(String key) {
@@ -264,7 +281,8 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 			DEFAULT_GI_SCALE, DEFAULT_GI_CHECKERBOARD, DEFAULT_GI_EMISSIVE,
 			false, DEFAULT_VOLUME_STRENGTH, DEFAULT_VOLUME_DENSITY, DEFAULT_VOLUME_STEPS, DEFAULT_VOLUME_DISTANCE, DEFAULT_VOLUME_GLOW,
 			false, DEFAULT_SUN_RAYS_STRENGTH,
-			false, DEFAULT_WET_STRENGTH, DEFAULT_WET_DRY_SECONDS);
+			false, DEFAULT_WET_STRENGTH, DEFAULT_WET_DRY_SECONDS,
+			DEFAULT_VOXEL_BUDGET_MS, DEFAULT_VOXEL_REBUILD_SECONDS, DEFAULT_MATERIAL_BUDGET_MS, DEFAULT_VOXEL_EMITTER_CAP);
 		try (var reader = Files.newBufferedReader(path)) {
 			var parsed = JsonParser.parseReader(reader);
 			require(parsed.isJsonObject(), "configuration must be an object");
@@ -392,6 +410,10 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 			float sunRaysStrength = readFloat(json, spec("sun_rays_strength"));
 			float wetStrength = readFloat(json, spec("wet_strength"));
 			float wetDrySeconds = readFloat(json, spec("wet_dry_seconds"));
+			float voxelBudgetMs = readFloat(json, spec("voxel_budget_ms"));
+			float voxelRebuildSeconds = readFloat(json, spec("voxel_rebuild_seconds"));
+			float materialBudgetMs = readFloat(json, spec("material_budget_ms"));
+			int voxelEmitterCap = readInt(json, spec("voxel_emitter_cap"));
 			return new ClientConfig(mode, grain, diagnostics, bloomThreshold, bloomStrength, gradeStrength, grainStrength,
 				fxaa, fxaaStrength,
 				autoExposure, exposureTarget, exposureMin, exposureMax, exposureSpeed,
@@ -408,7 +430,8 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 				voxelGi, giStrength, giRays, giDistance, giSky, giBounces, giScale, giCheckerboard, giEmissive,
 				volumetricLight, volumeStrength, volumeDensity, volumeSteps, volumeDistance, volumeGlow,
 				sunRays, sunRaysStrength,
-				wetness, wetStrength, wetDrySeconds);
+				wetness, wetStrength, wetDrySeconds,
+				voxelBudgetMs, voxelRebuildSeconds, materialBudgetMs, voxelEmitterCap);
 		}
 	}
 
@@ -502,6 +525,10 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 			case "wetness" -> config.wetness();
 			case "wet_strength" -> config.wetStrength();
 			case "wet_dry_seconds" -> config.wetDrySeconds();
+			case "voxel_budget_ms" -> config.voxelBudgetMs();
+			case "voxel_rebuild_seconds" -> config.voxelRebuildSeconds();
+			case "material_budget_ms" -> config.materialBudgetMs();
+			case "voxel_emitter_cap" -> config.voxelEmitterCap();
 			case "diagnostics_path" -> config.diagnosticsPath();
 			case "haze_color" -> config.hazeColor();
 			default -> throw new IllegalArgumentException("no option value for " + key);

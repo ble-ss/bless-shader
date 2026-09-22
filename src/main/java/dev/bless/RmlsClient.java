@@ -39,33 +39,22 @@ public final class RmlsClient implements ClientModInitializer {
 			// level -- each kept growing stale positions (and a stale ClientLevel) across every trip.
 			DepthEffects levelWatcher = depth;
 			ClientLevelEvents.AFTER_CLIENT_LEVEL_CHANGE.register((client, level) -> levelWatcher.levelChanged());
-			// light-volume item 3's third rebuild trigger: a chunk inside the volume loaded or
-			// unloaded. never reads the chunk here -- CHUNK_LOAD handlers may only read their own
-			// chunk (the bench manual's own trap), and this handler reads nothing at all.
-			if (config.voxelVolumeNeeded()) {
-				DepthEffects lit = depth;
-				ClientChunkEvents.CHUNK_LOAD.register((level, chunk) -> lit.lightChunkChanged());
-				ClientChunkEvents.CHUNK_UNLOAD.register((level, chunk) -> lit.lightChunkChanged());
-			}
-			// the material mask's own chunk ledger (brief item 2) -- registered when metal or water
-			// reflections are configured (grass-glint brief item 1: the same scan now also tracks
-			// water surfaces, water reflections' own material mask), so a shelf without either never
-			// pays for the scan.
-			boolean wantsMaterialScan = config.metalReflections() || config.waterReflections() || config.glassReflections();
-			if (wantsMaterialScan) {
-				DepthEffects scan = depth;
-				ClientChunkEvents.CHUNK_LOAD.register((level, chunk) -> scan.chunkLoaded(chunk));
-				ClientChunkEvents.CHUNK_UNLOAD.register((level, chunk) -> scan.chunkUnloaded(chunk));
-			}
-			// the shadow mesh's own chunk ledger (bless-shadow-pass brief item 5) -- registered only
-			// when sun shadows are configured, mirroring the material scan's own gate above; both
-			// DepthEffects.chunkLoaded/chunkUnloaded already no-op internally when a flag is off, so
-			// registering here just avoids paying for an event handler nobody asked for.
-			if (config.sunShadows() && !wantsMaterialScan) {
-				DepthEffects mesh = depth;
-				ClientChunkEvents.CHUNK_LOAD.register((level, chunk) -> mesh.chunkLoaded(chunk));
-				ClientChunkEvents.CHUNK_UNLOAD.register((level, chunk) -> mesh.chunkUnloaded(chunk));
-			}
+			// live-toggle repair 2026-09-21: these three used to gate on the launch-time config alone
+			// (voxel volume / material scan / shadow mesh each only registered when that config already
+			// wanted them), matching the "no handler nobody asked for" rule the bench manual likes. but
+			// DepthEffects.reloaded() can now turn any of these on later from the settings screen, and
+			// CHUNK_LOAD/CHUNK_UNLOAD only ever fires for a chunk arriving after a handler is listening
+			// -- a handler registered post-launch would silently miss every chunk already loaded before
+			// that reload (reloaded()'s own feedLoadedChunks() covers that gap once, but only future
+			// chunk churn keeps a tracker current). so both events register unconditionally now, one
+			// handler each: DepthEffects.chunkLoaded/chunkUnloaded already no-op per tracker internally
+			// (wantsMaterialScan()/config.sunShadows()), and lightChunkChanged() no-ops when volume ==
+			// null, so a shelf with every depth flag off still pays nothing but the event dispatch itself.
+			// never reads the chunk here beyond that -- CHUNK_LOAD handlers may only read their own
+			// chunk (the bench manual's own trap).
+			DepthEffects tracked = depth;
+			ClientChunkEvents.CHUNK_LOAD.register((level, chunk) -> { tracked.lightChunkChanged(); tracked.chunkLoaded(chunk); });
+			ClientChunkEvents.CHUNK_UNLOAD.register((level, chunk) -> { tracked.lightChunkChanged(); tracked.chunkUnloaded(chunk); });
 			LOGGER.info("bless configured: mode={}, grain={}", config.mode(), config.grain());
 			// the settings screen's own way in when mod menu is absent -- unbound by default, so it
 			// never steals a key a player already relies on.

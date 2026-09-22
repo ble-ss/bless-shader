@@ -110,8 +110,10 @@ final class VoxelVolume {
 	private BitSet thinnedCells;
 	// leak-repairs item 4a: a snapshot with an unbounded lava sea in it produced hundreds of thousands
 	// of emitters, each running its own flood -- keep only the nearest voxelEmitterCap to the volume
-	// centre. rmls-cost brief item 3: this used to be a fixed 4096; now a live knob, default 1024.
-	volatile int voxelEmitterCap = 1024;
+	// centre. rmls-cost brief item 3: this used to be a fixed 4096; now a live knob, default 384
+	// (repair 2026-09-21 item 3, down from 1024 -- overwritten from config every tick regardless, this
+	// initial value only covers the sliver before the first tick).
+	volatile int voxelEmitterCap = 384;
 	// rmls-cost brief item 3: the fluid-only 5x5x5 thinning below still applies at any emitter count,
 	// but once the raw count exceeds voxelEmitterCap every emitter (not just fluids) also gets thinned,
 	// at the finer 3x3x3 grid -- a village of candles is otherwise hundreds of same-brightness floods a

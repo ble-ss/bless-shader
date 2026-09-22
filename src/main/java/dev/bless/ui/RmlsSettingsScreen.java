@@ -2,6 +2,7 @@ package dev.bless.ui;
 
 import dev.bless.ClientConfig;
 import dev.bless.ClientConfig.OptionSpec;
+import com.mojang.blaze3d.systems.RenderSystem;
 import dev.bless.RmlsClient;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -20,12 +21,15 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
  * every bless knob in one scrollable list, grouped colour then depth (ClientConfig.OPTIONS
  * owns the grouping and the ranges -- this screen never carries a number of its own). closing the
- * screen, by "done" or escape, writes the whole config and reloads it the same way F3+T does.
+ * screen, by "done" or escape, writes the whole config and reloads it the same way F3+T does --
+ * since the live-toggle repair (2026-09-21), that reload finishes the on/off flags too (colored_light,
+ * sun_shadows, voxel_gi and the rest), not just the numeric knobs, so nothing here needs a restart.
  */
 public final class RmlsSettingsScreen extends Screen {
 	private static final Logger LOGGER = LoggerFactory.getLogger("bless");
@@ -49,9 +53,20 @@ public final class RmlsSettingsScreen extends Screen {
 		if (loaded != null) for (OptionSpec option : ClientConfig.OPTIONS) values.put(option.key(), ClientConfig.value(loaded, option.key()));
 	}
 
+	// read once per screen open on the render thread; the backend cannot change while the game runs.
+	private boolean onOpenGl;
+
 	@Override
 	protected void init() {
-		ConfigList list = new ConfigList(minecraft, width, height - 36, 24, 22);
+		onOpenGl = RenderSystem.getDevice().getDeviceInfo().backendName().toLowerCase(Locale.ROOT).contains("opengl");
+		// AbstractSelectionList's height arg sets the widget's own height field (an extent, not a
+		// bottom-edge y), so it must subtract the y0 below to leave the done button's band clear --
+		// passing height-36 here left the list's bbox 16px into the button, so most clicks on "done"
+		// hit the scrolled row underneath instead (getChildAt returns the first bbox match, and the
+		// list is added before the button).
+		// y0 32 leaves a line under the title for the backend warning; height - 68 keeps the
+		// list's bottom edge 8px clear of the done button, the same clearance as before.
+		ConfigList list = new ConfigList(minecraft, width, height - 68, 32, 22);
 		String currentGroup = null;
 		for (OptionSpec option : ClientConfig.OPTIONS) {
 			if (!option.group().equals(currentGroup)) {
@@ -86,6 +101,10 @@ public final class RmlsSettingsScreen extends Screen {
 	public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
 		super.extractRenderState(graphics, mouseX, mouseY, partialTick);
 		graphics.centeredText(font, title, width / 2, 6, 0xFFFFFFFF);
+		if (onOpenGl) {
+			graphics.centeredText(font, Component.literal("graphics backend is opengl: the depth stage stays off until you pick vulkan in video settings"),
+				width / 2, 18, 0xFFFF7777);
+		}
 		if (loaded == null) {
 			graphics.centeredText(font, Component.literal("config/bless.json could not be read"), width / 2, height / 2, 0xFFFF7777);
 		} else if (saveFailed) {

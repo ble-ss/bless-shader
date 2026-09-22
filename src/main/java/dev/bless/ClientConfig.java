@@ -156,7 +156,11 @@ public record ClientConfig(String mode, boolean grain, Path diagnosticsPath,
 	private static final float DEFAULT_VOXEL_BUDGET_MS = 1.0f;
 	private static final float DEFAULT_VOXEL_REBUILD_SECONDS = 2.0f;
 	private static final float DEFAULT_MATERIAL_BUDGET_MS = 0.25f;
-	private static final int DEFAULT_VOXEL_EMITTER_CAP = 1024;
+	// repair 2026-09-21 item 3: 1024 -> 384 -- rori's world carries 535 emitters and still cost 70ms to
+	// fill; the crowded-thinning threshold in VoxelVolume (`emitterTotal > emitterCap`) follows this
+	// cap automatically, so lowering it here is the whole fix. the nearest 384 lights are the ones that
+	// matter (selectEmitters already orders by distance to the volume centre).
+	private static final int DEFAULT_VOXEL_EMITTER_CAP = 384;
 	private static final java.util.regex.Pattern HEX_COLOR = java.util.regex.Pattern.compile("^#[0-9a-fA-F]{6}$");
 
 	// the one table every knob's range, default and screen label come from -- the reader below

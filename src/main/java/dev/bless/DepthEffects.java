@@ -15,12 +15,16 @@ import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
+import net.minecraft.client.multiplayer.ClientChunkCache;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 import org.joml.Matrix4f;
 import org.joml.Vector4f;
 import org.lwjgl.system.MemoryUtil;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -32,13 +36,19 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static dev.bless.ClientConfig.require;
 
 /** optional world-depth owner. the late color chain and its resources remain separate. */
 final class DepthEffects {
-	private final ClientConfig config;
+	// live-toggle repair 2026-09-21: was final. a feature flag flipped in the settings screen needs
+	// reloaded() to swap this reference for a freshly-read one, the same way the four tuning knobs
+	// already did through RmlsClient.currentDepthTuning() -- see reloaded()'s own doc comment.
+	private ClientConfig config;
 	private final DepthFrameInputs inputs = new DepthFrameInputs();
 	private volatile RmlsDepthTuning tuning;
 	private final Map<String, Long> skips = new LinkedHashMap<>();
@@ -49,6 +59,7 @@ final class DepthEffects {
 	private Map<String, Object> firstExecution, diagnosticCapture;
 	private List<Map<String, Object>> targets = List.of();
 	private String state, backend, lastError;
+	private boolean backendWarned;
 	private Integer width, height;
 	private long begun, captures, earlyFrames, contactFrames, raysFrames, hazeFrames, aoFrames, reflectionsFrames, lightFrames, shadowFrames, giFrames, volumetricFrames, sunRaysFrames, diagnosticFrames, executedFrames;
 	private long resizeCount, reloadCount, shaderEpoch, errorCount;
@@ -150,6 +161,34 @@ final class DepthEffects {
 	// are already built, stale ones included, same as a plain cache hit would.
 	private static final int PHASE_METAL = 0, PHASE_WATER = 1, PHASE_GLASS = 2, PHASE_PANES = 3, PHASE_COUNT = 4;
 	private int metalRebuildPhase = -1;
+	// repair 2026-09-21 item 2: the gather (positionsNear, a ConcurrentHashMap walk -- safe off the
+	// render thread) and the byte-filling used to both run on the render thread inside
+	// runMetalRebuildPhase; on a loaded world (9240 metal, 21598 water, 12509 glass tracked) that
+	// made the scan tick p95 4.5ms. now only the level-dependent parts (glass tint's colour lookup,
+	// a pane's own collision-shape boxes -- both need BlockState/ClientLevel, which stays render-
+	// thread only, same rule as the CHUNK_LOAD handlers) still happen here; everything else moves to
+	// this single worker (VoxelVolume's own shape: one background thread, an AtomicReference handback).
+	// one phase builds at a time (the rotation is already sequential), so one in-flight flag and one
+	// pending slot cover all four kinds -- a build already in flight is polled, not restarted, and the
+	// rotation does not advance past a phase until its buffer is actually ready.
+	private final ExecutorService materialWorker = Executors.newSingleThreadExecutor(runnable -> {
+		Thread thread = new Thread(runnable, "bless-material-mask");
+		thread.setDaemon(true);
+		return thread;
+	});
+	private final AtomicBoolean materialBuildInFlight = new AtomicBoolean(false);
+	private final AtomicReference<MaterialBuild> materialPendingResult = new AtomicReference<>();
+	private double lastMaterialRebuildMillis;
+
+	// the worker's finished staging bytes for one phase, handed back for the render thread to
+	// createBuffer from and free -- only the fields for `phase` are non-null.
+	private record MaterialBuild(int phase, double buildMillis,
+			ByteBuffer metalBytes, int metalCount,
+			ByteBuffer waterBytes, int waterCount,
+			ByteBuffer glassBytes, int glassCount,
+			ByteBuffer glassTintBytes, int glassTintCount,
+			ByteBuffer paneMaskBytes, int paneMaskCount, int paneMaskBlocks,
+			ByteBuffer paneTintBytes, int paneTintCount) {}
 	// item 4: wall-clock cost of the per-frame metal path (the scan's own budgeted resume plus,
 	// on a cache miss, the nearest-4096 query and vertex buffer rebuild) -- last and peak.
 	private volatile long lastMetalTickMicros, maxMetalTickMicros;
@@ -334,11 +373,27 @@ final class DepthEffects {
 		long tickStart = System.nanoTime();
 		metalScan.materialBudgetMs = config.materialBudgetMs();
 		metalScan.refresh(level, BlockPos.containing(camera), frame.gameTime());
-		// rmls-cost brief item 2c: a rotation already in progress runs to completion regardless of new
-		// triggers landing mid-way -- finishing what was started keeps the phase count honest and never
-		// leaves a buffer more than one rotation stale.
-		if (metalRebuildPhase >= 0) {
-			runMetalRebuildPhase(metalRebuildPhase, level, camera);
+		// repair 2026-09-21 item 2: the cache-trigger check below only ever runs between rotations
+		// (metalRebuildPhase < 0) -- once a rotation starts it always runs to completion regardless of
+		// new triggers landing mid-way, same rule as before. a phase now may take more than one frame
+		// (its build is on the worker), so the rotation only advances once runMetalRebuildPhase reports
+		// that phase's buffer is actually ready.
+		if (metalRebuildPhase < 0) {
+			long revision = metalScan.revision();
+			boolean cameraMoved = !metalGeometryValid || camera.distanceTo(lastMetalCameraPos) > 16.0;
+			boolean revisionChanged = revision != lastMetalScanRevision;
+			if (metalGeometryValid && !cameraMoved && !revisionChanged) {
+				recordMetalTickMicros(tickStart);
+				return; // cached buffers (or cached "nothing to draw") still good
+			}
+			long now = System.currentTimeMillis();
+			if (metalGeometryValid && now - lastMetalRebuildMillis < METAL_REBUILD_MIN_INTERVAL_MILLIS) {
+				recordMetalTickMicros(tickStart);
+				return; // rate-limited: a revision/camera trigger landed inside the 250 ms floor
+			}
+			metalRebuildPhase = PHASE_METAL; // start a fresh rotation
+		}
+		if (runMetalRebuildPhase(metalRebuildPhase, level, camera)) {
 			metalRebuildPhase++;
 			if (metalRebuildPhase >= PHASE_COUNT) {
 				metalRebuildPhase = -1;
@@ -354,25 +409,7 @@ final class DepthEffects {
 				// clearing it here skipped the resolve for a frame on every geometry rebuild).
 				shadowRedrawRequested = true;
 			}
-			recordMetalTickMicros(tickStart);
-			return;
 		}
-		long revision = metalScan.revision();
-		boolean cameraMoved = !metalGeometryValid || camera.distanceTo(lastMetalCameraPos) > 16.0;
-		boolean revisionChanged = revision != lastMetalScanRevision;
-		if (metalGeometryValid && !cameraMoved && !revisionChanged) {
-			recordMetalTickMicros(tickStart);
-			return; // cached buffers (or cached "nothing to draw") still good
-		}
-		long now = System.currentTimeMillis();
-		if (metalGeometryValid && now - lastMetalRebuildMillis < METAL_REBUILD_MIN_INTERVAL_MILLIS) {
-			recordMetalTickMicros(tickStart);
-			return; // rate-limited: a revision/camera trigger landed inside the 250 ms floor
-		}
-		// start a fresh four-frame rotation: this frame pays for phase 0 only, the rest follow above.
-		metalRebuildPhase = PHASE_METAL;
-		runMetalRebuildPhase(metalRebuildPhase, level, camera);
-		metalRebuildPhase++;
 		recordMetalTickMicros(tickStart);
 	}
 
@@ -380,16 +417,295 @@ final class DepthEffects {
 	// in one frame -- metal and water are each their own positionsNear query, glass folds its coloured
 	// tint twin in (same glassPositionsNear query, brief calls them one "kind"), panes builds both its
 	// buffers from one panePositionsNear query the same way.
-	private void runMetalRebuildPhase(int phase, net.minecraft.client.multiplayer.ClientLevel level, net.minecraft.world.phys.Vec3 camera) {
-		switch (phase) {
-			case PHASE_METAL -> rebuildMetalVertexBuffer(camera);
-			case PHASE_WATER -> rebuildWaterVertexBuffer(camera);
-			case PHASE_GLASS -> {
-				rebuildGlassVertexBuffer(camera);
-				rebuildGlassTintVertexBuffer(level, camera);
-			}
-			case PHASE_PANES -> rebuildPaneVertexBuffers(level, camera);
+	//
+	// repair 2026-09-21 item 2: returns true once `phase`'s buffer is actually built and uploaded --
+	// false means "still cooking on the worker, call again next frame." drains a finished result first
+	// (createBuffer + free the staging bytes, both render-thread-only), then polls the in-flight flag,
+	// then -- only if nothing is running or done -- starts this phase's build.
+	private boolean runMetalRebuildPhase(int phase, net.minecraft.client.multiplayer.ClientLevel level, net.minecraft.world.phys.Vec3 camera) {
+		MaterialBuild finished = materialPendingResult.getAndSet(null);
+		if (finished != null) {
+			applyMaterialBuild(finished);
+			materialBuildInFlight.set(false);
+			return true;
 		}
+		if (materialBuildInFlight.get()) return false; // a rebuild already in flight is not restarted
+		switch (phase) {
+			case PHASE_METAL -> startMetalBuild(camera);
+			case PHASE_WATER -> startWaterBuild(camera);
+			case PHASE_GLASS -> startGlassBuild(level, camera);
+			case PHASE_PANES -> startPaneBuild(level, camera);
+		}
+		return false; // just submitted; not ready this frame
+	}
+
+	private void applyMaterialBuild(MaterialBuild build) {
+		lastMaterialRebuildMillis = build.buildMillis();
+		try {
+			switch (build.phase()) {
+				case PHASE_METAL -> {
+					closeMetalVertexBuffer();
+					if (build.metalBytes() != null) {
+						metalVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless metal mask vertices", GpuBuffer.USAGE_VERTEX, build.metalBytes());
+						metalVertexCount = build.metalCount();
+					}
+				}
+				case PHASE_WATER -> {
+					closeWaterVertexBuffer();
+					if (build.waterBytes() != null) {
+						waterMaskVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless water mask vertices", GpuBuffer.USAGE_VERTEX, build.waterBytes());
+						waterMaskVertexCount = build.waterCount();
+					}
+				}
+				case PHASE_GLASS -> {
+					closeGlassVertexBuffer();
+					if (build.glassBytes() != null) {
+						glassMaskVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless glass mask vertices", GpuBuffer.USAGE_VERTEX, build.glassBytes());
+						glassMaskVertexCount = build.glassCount();
+					}
+					closeGlassTintVertexBuffer();
+					if (build.glassTintBytes() != null) {
+						glassTintVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless glass tint vertices", GpuBuffer.USAGE_VERTEX, build.glassTintBytes());
+						glassTintVertexCount = build.glassTintCount();
+					}
+				}
+				case PHASE_PANES -> {
+					closePaneMaskVertexBuffer();
+					if (build.paneMaskBytes() != null) {
+						paneMaskVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless pane mask vertices", GpuBuffer.USAGE_VERTEX, build.paneMaskBytes());
+						paneMaskVertexCount = build.paneMaskCount();
+						paneMaskBlockCount = build.paneMaskBlocks();
+					}
+					closePaneTintVertexBuffer();
+					if (build.paneTintBytes() != null) {
+						paneTintVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless pane tint vertices", GpuBuffer.USAGE_VERTEX, build.paneTintBytes());
+						paneTintVertexCount = build.paneTintCount();
+					}
+				}
+			}
+		} finally {
+			freeMaterialBuild(build);
+		}
+	}
+
+	private static void freeMaterialBuild(MaterialBuild build) {
+		if (build.metalBytes() != null) MemoryUtil.memFree(build.metalBytes());
+		if (build.waterBytes() != null) MemoryUtil.memFree(build.waterBytes());
+		if (build.glassBytes() != null) MemoryUtil.memFree(build.glassBytes());
+		if (build.glassTintBytes() != null) MemoryUtil.memFree(build.glassTintBytes());
+		if (build.paneMaskBytes() != null) MemoryUtil.memFree(build.paneMaskBytes());
+		if (build.paneTintBytes() != null) MemoryUtil.memFree(build.paneTintBytes());
+	}
+
+	// metal/water/plain-glass-mask never touch ClientLevel (positionsNear only walks MetalMaskScan's
+	// own ConcurrentHashMaps), so the gather moves into the worker task itself, same as the fill.
+	private void startMetalBuild(net.minecraft.world.phys.Vec3 camera) {
+		boolean wants = config.metalReflections();
+		materialBuildInFlight.set(true);
+		materialWorker.submit(() -> {
+			long start = System.nanoTime();
+			ByteBuffer data = null;
+			int count = 0;
+			if (wants) {
+				var positions = metalScan.positionsNear(camera, 64.0, 4096);
+				if (!positions.isEmpty()) {
+					data = MemoryUtil.memAlloc(positions.size() * CUBE_OFFSETS.length * 4);
+					for (BlockPos pos : positions)
+						for (int i = 0; i < CUBE_OFFSETS.length; i += 3) {
+							data.putFloat(pos.getX() + CUBE_OFFSETS[i]);
+							data.putFloat(pos.getY() + CUBE_OFFSETS[i + 1]);
+							data.putFloat(pos.getZ() + CUBE_OFFSETS[i + 2]);
+						}
+					data.flip();
+					count = positions.size() * 12 * 3;
+				}
+			}
+			double buildMillis = (System.nanoTime() - start) / 1_000_000.0;
+			materialPendingResult.set(new MaterialBuild(PHASE_METAL, buildMillis, data, count,
+				null, 0, null, 0, null, 0, null, 0, 0, null, 0));
+		});
+	}
+
+	private void startWaterBuild(net.minecraft.world.phys.Vec3 camera) {
+		boolean wants = config.waterReflections();
+		materialBuildInFlight.set(true);
+		materialWorker.submit(() -> {
+			long start = System.nanoTime();
+			ByteBuffer data = null;
+			int count = 0;
+			if (wants) {
+				var positions = metalScan.waterPositionsNear(camera, 64.0, 8192);
+				if (!positions.isEmpty()) {
+					data = MemoryUtil.memAlloc(positions.size() * WATER_QUAD_OFFSETS.length * 4);
+					for (BlockPos pos : positions)
+						for (int i = 0; i < WATER_QUAD_OFFSETS.length; i += 3) {
+							data.putFloat(pos.getX() + WATER_QUAD_OFFSETS[i]);
+							data.putFloat(pos.getY() + WATER_QUAD_OFFSETS[i + 1]);
+							data.putFloat(pos.getZ() + WATER_QUAD_OFFSETS[i + 2]);
+						}
+					data.flip();
+					count = positions.size() * 2 * 3;
+				}
+			}
+			double buildMillis = (System.nanoTime() - start) / 1_000_000.0;
+			materialPendingResult.set(new MaterialBuild(PHASE_WATER, buildMillis, null, 0,
+				data, count, null, 0, null, 0, null, 0, 0, null, 0));
+		});
+	}
+
+	// the plain mask never needs the level, but the tint does (BlockState/MapColor lookups) -- those
+	// must stay on the render thread (same rule as CHUNK_LOAD: a chunk read off-thread is unsafe), so
+	// this snapshots the tint's per-position colour here first, then hands both position lists to the
+	// worker for the byte-filling only.
+	private void startGlassBuild(net.minecraft.client.multiplayer.ClientLevel level, net.minecraft.world.phys.Vec3 camera) {
+		boolean wantsMask = config.glassReflections();
+		boolean wantsTint = config.glassLight();
+		materialBuildInFlight.set(true);
+		// gathered here only when the tint needs it (its own level reads below require this list
+		// anyway); when only the mask is wanted the worker gathers for itself, no render-thread cost.
+		List<BlockPos> maskPositions = null;
+		List<BlockPos> tintPositions = null;
+		it.unimi.dsi.fastutil.ints.IntArrayList tintColors = null;
+		if (wantsTint) {
+			var positions = metalScan.glassPositionsNear(camera, 64.0, 4096);
+			tintPositions = new ArrayList<>(positions.size());
+			tintColors = new it.unimi.dsi.fastutil.ints.IntArrayList(positions.size());
+			var cursor = new BlockPos.MutableBlockPos();
+			for (BlockPos pos : positions) {
+				net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+				if (!GlassBlocks.isGlass(state) || GlassBlocks.isTinted(state)) continue;
+				int color;
+				if (state.is(net.minecraft.world.level.block.Blocks.GLASS)) color = 0xFFFFFF;
+				else {
+					var map = state.getMapColor(level, cursor.set(pos));
+					color = map == net.minecraft.world.level.material.MapColor.NONE ? 0xFFFFFF : map.col;
+				}
+				tintPositions.add(pos);
+				tintColors.add(color);
+			}
+			// the mask draws every glassPositionsNear hit regardless of tint eligibility -- reuse this
+			// same query for it instead of paying for a second gather in the worker.
+			maskPositions = wantsMask ? positions : null;
+		}
+		List<BlockPos> finalMaskPositions = maskPositions;
+		List<BlockPos> finalTintPositions = tintPositions;
+		it.unimi.dsi.fastutil.ints.IntArrayList finalTintColors = tintColors;
+		materialWorker.submit(() -> {
+			long start = System.nanoTime();
+			ByteBuffer maskData = null;
+			int maskCount = 0;
+			if (wantsMask) {
+				var positions = finalMaskPositions != null ? finalMaskPositions : metalScan.glassPositionsNear(camera, 64.0, 4096);
+				if (!positions.isEmpty()) {
+					maskData = MemoryUtil.memAlloc(positions.size() * CUBE_OFFSETS.length * 4);
+					for (BlockPos pos : positions)
+						for (int i = 0; i < CUBE_OFFSETS.length; i += 3) {
+							maskData.putFloat(pos.getX() + CUBE_OFFSETS[i]);
+							maskData.putFloat(pos.getY() + CUBE_OFFSETS[i + 1]);
+							maskData.putFloat(pos.getZ() + CUBE_OFFSETS[i + 2]);
+						}
+					maskData.flip();
+					maskCount = positions.size() * 12 * 3;
+				}
+			}
+			ByteBuffer tintData = null;
+			int tintCount = 0;
+			if (wantsTint && !finalTintPositions.isEmpty()) {
+				tintData = MemoryUtil.memAlloc(finalTintPositions.size() * (CUBE_OFFSETS.length / 3) * 16);
+				for (int p = 0; p < finalTintPositions.size(); p++) {
+					BlockPos pos = finalTintPositions.get(p);
+					int color = finalTintColors.getInt(p);
+					byte r = (byte) ((color >> 16) & 0xFF), g = (byte) ((color >> 8) & 0xFF), b = (byte) (color & 0xFF);
+					for (int i = 0; i < CUBE_OFFSETS.length; i += 3) {
+						tintData.putFloat(pos.getX() + CUBE_OFFSETS[i]);
+						tintData.putFloat(pos.getY() + CUBE_OFFSETS[i + 1]);
+						tintData.putFloat(pos.getZ() + CUBE_OFFSETS[i + 2]);
+						tintData.put(r).put(g).put(b).put((byte) 0xFF);
+					}
+					tintCount += CUBE_OFFSETS.length / 3;
+				}
+				tintData.flip();
+			}
+			double buildMillis = (System.nanoTime() - start) / 1_000_000.0;
+			materialPendingResult.set(new MaterialBuild(PHASE_GLASS, buildMillis, null, 0, null, 0,
+				maskData, maskCount, tintData, tintCount, null, 0, 0, null, 0));
+		});
+	}
+
+	// panes brief item 3's geometry needs the level regardless of which output is wanted (a pane's own
+	// collision-shape boxes drive both the mask and the tint), so the whole snapshot -- position,
+	// boxes, owner, colour -- happens here on the render thread; the worker only fills bytes from it.
+	private void startPaneBuild(net.minecraft.client.multiplayer.ClientLevel level, net.minecraft.world.phys.Vec3 camera) {
+		boolean wantsMask = config.glassReflections();
+		boolean wantsTint = config.glassLight();
+		materialBuildInFlight.set(true);
+		List<net.minecraft.world.phys.AABB> boxes = new ArrayList<>();
+		List<BlockPos> owners = new ArrayList<>();
+		it.unimi.dsi.fastutil.ints.IntArrayList colors = new it.unimi.dsi.fastutil.ints.IntArrayList();
+		int blocksWithGeometry = 0;
+		int boxesDropped = 0;
+		if (wantsMask || wantsTint) {
+			var positions = metalScan.panePositionsNear(camera, 64.0, 4096);
+			var cursor = new BlockPos.MutableBlockPos();
+			for (BlockPos pos : positions) {
+				net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
+				var shape = state.getCollisionShape(level, pos);
+				var shapeBoxes = shape.toAabbs();
+				if (shapeBoxes.isEmpty()) continue;
+				int color = GlassBlocks.paneTint(state, level, cursor.set(pos));
+				int taken = Math.min(shapeBoxes.size(), PANE_BOX_CAP);
+				boxesDropped += shapeBoxes.size() - taken;
+				for (int i = 0; i < taken; i++) {
+					boxes.add(shapeBoxes.get(i));
+					owners.add(pos);
+					colors.add(color);
+				}
+				blocksWithGeometry++;
+			}
+		}
+		paneBoxesDropped = boxesDropped;
+		int finalBlockCount = blocksWithGeometry;
+		materialWorker.submit(() -> {
+			long start = System.nanoTime();
+			ByteBuffer maskData = null;
+			int maskCount = 0;
+			if (wantsMask && !boxes.isEmpty()) {
+				maskData = MemoryUtil.memAlloc(boxes.size() * 36 * 12);
+				for (int i = 0; i < boxes.size(); i++) {
+					float[] verts = paneBoxVertices(boxes.get(i));
+					BlockPos pos = owners.get(i);
+					for (int k = 0; k < verts.length; k += 3) {
+						maskData.putFloat(pos.getX() + verts[k]);
+						maskData.putFloat(pos.getY() + verts[k + 1]);
+						maskData.putFloat(pos.getZ() + verts[k + 2]);
+					}
+				}
+				maskData.flip();
+				maskCount = boxes.size() * 36;
+			}
+			ByteBuffer tintData = null;
+			int tintCount = 0;
+			if (wantsTint && !boxes.isEmpty()) {
+				tintData = MemoryUtil.memAlloc(boxes.size() * 36 * 16);
+				for (int i = 0; i < boxes.size(); i++) {
+					float[] verts = paneBoxVertices(boxes.get(i));
+					BlockPos pos = owners.get(i);
+					int color = colors.getInt(i);
+					byte r = (byte) ((color >> 16) & 0xFF), g = (byte) ((color >> 8) & 0xFF), b = (byte) (color & 0xFF);
+					for (int k = 0; k < verts.length; k += 3) {
+						tintData.putFloat(pos.getX() + verts[k]);
+						tintData.putFloat(pos.getY() + verts[k + 1]);
+						tintData.putFloat(pos.getZ() + verts[k + 2]);
+						tintData.put(r).put(g).put(b).put((byte) 0xFF);
+					}
+				}
+				tintData.flip();
+				tintCount = boxes.size() * 36;
+			}
+			double buildMillis = (System.nanoTime() - start) / 1_000_000.0;
+			materialPendingResult.set(new MaterialBuild(PHASE_PANES, buildMillis, null, 0, null, 0, null, 0, null, 0,
+				maskData, maskCount, finalBlockCount, tintData, tintCount));
+		});
 	}
 
 	private void closeMetalVertexBuffer() {
@@ -423,123 +739,6 @@ final class DepthEffects {
 		paneTintVertexCount = 0;
 	}
 
-	private void rebuildMetalVertexBuffer(net.minecraft.world.phys.Vec3 camera) {
-		closeMetalVertexBuffer();
-		if (!config.metalReflections()) return;
-		var positions = metalScan.positionsNear(camera, 64.0, 4096);
-		if (positions.isEmpty()) return;
-		ByteBuffer data = MemoryUtil.memAlloc(positions.size() * CUBE_OFFSETS.length * 4);
-		try {
-			for (BlockPos pos : positions)
-				for (int i = 0; i < CUBE_OFFSETS.length; i += 3) {
-					data.putFloat(pos.getX() + CUBE_OFFSETS[i]);
-					data.putFloat(pos.getY() + CUBE_OFFSETS[i + 1]);
-					data.putFloat(pos.getZ() + CUBE_OFFSETS[i + 2]);
-				}
-			data.flip();
-			metalVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless metal mask vertices", GpuBuffer.USAGE_VERTEX, data);
-			metalVertexCount = positions.size() * 12 * 3;
-		} finally {
-			MemoryUtil.memFree(data);
-		}
-	}
-
-	// grass-glint brief item 1: the water-surface twin of rebuildMetalVertexBuffer above -- same
-	// cache, same 64-block/4096-cap query, one flat quad per surface block instead of a cube.
-	private void rebuildWaterVertexBuffer(net.minecraft.world.phys.Vec3 camera) {
-		closeWaterVertexBuffer();
-		if (!config.waterReflections()) return;
-		// rmls-cost brief item 2d: this used to reach 96 blocks and keep 24576 quads on the theory that
-		// an ocean deserves more reach than a metal cube -- but a mask past 64 blocks reads as half-
-		// resolution mush anyway (the reflection ray march itself does not go further), and on rori's
-		// live world 21598 tracked water surfaces made the gather this asked for the real cost. 64
-		// blocks and 8192 quads (still double metal/glass's own 4096-cube cap, water still covers more
-		// ground per position than a cube does) cuts both the gather and the vertex upload down.
-		var positions = metalScan.waterPositionsNear(camera, 64.0, 8192);
-		if (positions.isEmpty()) return;
-		ByteBuffer data = MemoryUtil.memAlloc(positions.size() * WATER_QUAD_OFFSETS.length * 4);
-		try {
-			for (BlockPos pos : positions)
-				for (int i = 0; i < WATER_QUAD_OFFSETS.length; i += 3) {
-					data.putFloat(pos.getX() + WATER_QUAD_OFFSETS[i]);
-					data.putFloat(pos.getY() + WATER_QUAD_OFFSETS[i + 1]);
-					data.putFloat(pos.getZ() + WATER_QUAD_OFFSETS[i + 2]);
-				}
-			data.flip();
-			waterMaskVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless water mask vertices", GpuBuffer.USAGE_VERTEX, data);
-			waterMaskVertexCount = positions.size() * 2 * 3; // 2 triangles, 3 vertices each
-		} finally {
-			MemoryUtil.memFree(data);
-		}
-	}
-
-	// glass brief item 4: the glass twin of rebuildMetalVertexBuffer -- same cache, same 64-block/4096
-	// cap query, cubes (CUBE_OFFSETS reused) since a windowpane keeps its full block shape unlike a
-	// water surface's flat quad.
-	private void rebuildGlassVertexBuffer(net.minecraft.world.phys.Vec3 camera) {
-		closeGlassVertexBuffer();
-		if (!config.glassReflections()) return;
-		var positions = metalScan.glassPositionsNear(camera, 64.0, 4096);
-		if (positions.isEmpty()) return;
-		ByteBuffer data = MemoryUtil.memAlloc(positions.size() * CUBE_OFFSETS.length * 4);
-		try {
-			for (BlockPos pos : positions)
-				for (int i = 0; i < CUBE_OFFSETS.length; i += 3) {
-					data.putFloat(pos.getX() + CUBE_OFFSETS[i]);
-					data.putFloat(pos.getY() + CUBE_OFFSETS[i + 1]);
-					data.putFloat(pos.getZ() + CUBE_OFFSETS[i + 2]);
-				}
-			data.flip();
-			glassMaskVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless glass mask vertices", GpuBuffer.USAGE_VERTEX, data);
-			glassMaskVertexCount = positions.size() * 12 * 3;
-		} finally {
-			MemoryUtil.memFree(data);
-		}
-	}
-
-	// glass-light brief item 3: the coloured twin of rebuildGlassVertexBuffer above -- same cache, same
-	// query, cubes again (a windowpane keeps its full block shape for the tint draw too), but each
-	// vertex carries the block's own tint (DepthPipelines.SHADOW_TINT_VERTEX_FORMAT: position float3 +
-	// colour rgba8_unorm, 16 bytes) instead of plain position. tinted_glass is excluded the same way
-	// VoxelVolume.record() excludes it from FLAG_FILTER -- vanilla already blocks light through it, so
-	// it draws nothing here rather than tinting with whatever grey its own MapColor happens to be.
-	// gated on config.glassLight(), independent of glass_reflections.
-	private void rebuildGlassTintVertexBuffer(net.minecraft.client.multiplayer.ClientLevel level, net.minecraft.world.phys.Vec3 camera) {
-		closeGlassTintVertexBuffer();
-		if (!config.glassLight()) return;
-		var positions = metalScan.glassPositionsNear(camera, 64.0, 4096);
-		if (positions.isEmpty()) return;
-		ByteBuffer data = MemoryUtil.memAlloc(positions.size() * (CUBE_OFFSETS.length / 3) * 16);
-		int written = 0;
-		try {
-			var cursor = new BlockPos.MutableBlockPos();
-			for (BlockPos pos : positions) {
-				net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
-				if (!GlassBlocks.isGlass(state) || GlassBlocks.isTinted(state)) continue;
-				int color;
-				if (state.is(net.minecraft.world.level.block.Blocks.GLASS)) color = 0xFFFFFF;
-				else {
-					var map = state.getMapColor(level, cursor.set(pos));
-					color = map == net.minecraft.world.level.material.MapColor.NONE ? 0xFFFFFF : map.col;
-				}
-				byte r = (byte) ((color >> 16) & 0xFF), g = (byte) ((color >> 8) & 0xFF), b = (byte) (color & 0xFF);
-				for (int i = 0; i < CUBE_OFFSETS.length; i += 3) {
-					data.putFloat(pos.getX() + CUBE_OFFSETS[i]);
-					data.putFloat(pos.getY() + CUBE_OFFSETS[i + 1]);
-					data.putFloat(pos.getZ() + CUBE_OFFSETS[i + 2]);
-					data.put(r).put(g).put(b).put((byte) 0xFF);
-					written++;
-				}
-			}
-			if (written == 0) return;
-			data.flip();
-			glassTintVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless glass tint vertices", GpuBuffer.USAGE_VERTEX, data);
-			glassTintVertexCount = written;
-		} finally {
-			MemoryUtil.memFree(data);
-		}
-	}
-
 	// panes brief item 3: same generalized-cube face winding CUBE_OFFSETS uses (six faces, CCW viewed
 	// from outside, matching DepthPipelines.METAL_MASK's withCull(true)), parameterized per box's own
 	// min/max instead of the fixed 0/1 -- a pane's collision shape is not the unit cube. shared by the
@@ -569,88 +768,6 @@ final class DepthEffects {
 	// by the mask build (glass_reflections) and the tint build (glass_light) below so the shape query
 	// and paneTint colour lookup happen only once per position per rebuild.
 	private static final int PANE_BOX_CAP = 8;
-
-	// panes brief item 3: the pane twin of rebuildGlassVertexBuffer/rebuildGlassTintVertexBuffer --
-	// same cache trigger (called only from updateMetalGeometry's cache-miss branch), same
-	// 64-block/4096-position query, but geometry comes from each pane's own collision-shape boxes
-	// (up to PANE_BOX_CAP) instead of a full cube, since a pane is thin geometry that a cube mask
-	// would draw wrong (this brief's whole reason for existing, over the "pane get an isGlass cube"
-	// shortcut).
-	private void rebuildPaneVertexBuffers(net.minecraft.client.multiplayer.ClientLevel level, net.minecraft.world.phys.Vec3 camera) {
-		closePaneMaskVertexBuffer();
-		closePaneTintVertexBuffer();
-		paneBoxesDropped = 0;
-		if (!config.glassReflections() && !config.glassLight()) return;
-		var positions = metalScan.panePositionsNear(camera, 64.0, 4096);
-		if (positions.isEmpty()) return;
-		var cursor = new BlockPos.MutableBlockPos();
-		List<net.minecraft.world.phys.AABB> boxes = new ArrayList<>();
-		List<BlockPos> owners = new ArrayList<>();
-		it.unimi.dsi.fastutil.ints.IntArrayList colors = new it.unimi.dsi.fastutil.ints.IntArrayList();
-		int blocksWithGeometry = 0;
-		for (BlockPos pos : positions) {
-			net.minecraft.world.level.block.state.BlockState state = level.getBlockState(pos);
-			var shape = state.getCollisionShape(level, pos);
-			var shapeBoxes = shape.toAabbs();
-			if (shapeBoxes.isEmpty()) continue;
-			int color = GlassBlocks.paneTint(state, level, cursor.set(pos));
-			int taken = Math.min(shapeBoxes.size(), PANE_BOX_CAP);
-			paneBoxesDropped += shapeBoxes.size() - taken;
-			for (int i = 0; i < taken; i++) {
-				boxes.add(shapeBoxes.get(i));
-				owners.add(pos);
-				colors.add(color);
-			}
-			blocksWithGeometry++;
-		}
-		if (boxes.isEmpty()) return;
-		if (config.glassReflections()) buildPaneMaskBuffer(boxes, owners, blocksWithGeometry);
-		if (config.glassLight()) buildPaneTintBuffer(boxes, owners, colors);
-	}
-
-	private void buildPaneMaskBuffer(List<net.minecraft.world.phys.AABB> boxes, List<BlockPos> owners, int blockCount) {
-		ByteBuffer data = MemoryUtil.memAlloc(boxes.size() * 36 * 12);
-		try {
-			for (int i = 0; i < boxes.size(); i++) {
-				float[] verts = paneBoxVertices(boxes.get(i));
-				BlockPos pos = owners.get(i);
-				for (int k = 0; k < verts.length; k += 3) {
-					data.putFloat(pos.getX() + verts[k]);
-					data.putFloat(pos.getY() + verts[k + 1]);
-					data.putFloat(pos.getZ() + verts[k + 2]);
-				}
-			}
-			data.flip();
-			paneMaskVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless pane mask vertices", GpuBuffer.USAGE_VERTEX, data);
-			paneMaskVertexCount = boxes.size() * 36;
-			paneMaskBlockCount = blockCount;
-		} finally {
-			MemoryUtil.memFree(data);
-		}
-	}
-
-	private void buildPaneTintBuffer(List<net.minecraft.world.phys.AABB> boxes, List<BlockPos> owners, it.unimi.dsi.fastutil.ints.IntArrayList colors) {
-		ByteBuffer data = MemoryUtil.memAlloc(boxes.size() * 36 * 16);
-		try {
-			for (int i = 0; i < boxes.size(); i++) {
-				float[] verts = paneBoxVertices(boxes.get(i));
-				BlockPos pos = owners.get(i);
-				int color = colors.getInt(i);
-				byte r = (byte) ((color >> 16) & 0xFF), g = (byte) ((color >> 8) & 0xFF), b = (byte) (color & 0xFF);
-				for (int k = 0; k < verts.length; k += 3) {
-					data.putFloat(pos.getX() + verts[k]);
-					data.putFloat(pos.getY() + verts[k + 1]);
-					data.putFloat(pos.getZ() + verts[k + 2]);
-					data.put(r).put(g).put(b).put((byte) 0xFF);
-				}
-			}
-			data.flip();
-			paneTintVertexBuffer = RenderSystem.getDevice().createBuffer(() -> "bless pane tint vertices", GpuBuffer.USAGE_VERTEX, data);
-			paneTintVertexCount = boxes.size() * 36;
-		} finally {
-			MemoryUtil.memFree(data);
-		}
-	}
 
 	private void recordMetalTickMicros(long tickStartNanos) {
 		long tickMicros = (System.nanoTime() - tickStartNanos) / 1000L;
@@ -702,8 +819,23 @@ final class DepthEffects {
 			if (!inputs.projectionValid()) return;
 			earlyFrames++;
 			require(captures == earlyFrames, "early depth capture/frame attribution differs");
+			// the depth stage is written for vulkan. on opengl 4.1 (the mac ceiling) the same graph
+			// executed without a single error and painted every frame deep red (bench run
+			// gl-red-check-2, 2026-09-21: mean rgb 178/64/52 in a white room), which is exactly what
+			// rori saw the afternoon her instance fell back from vulkan to opengl. the readme has
+			// promised "colour chain alone on opengl" since 0.1.0; this is the line that keeps it.
+			// -Dbless.depth_on_opengl=true reopens the door for bench work on the opengl path.
+			if (!backendSupported()) {
+				recordSkip("depth", "backend_" + backend);
+				state = "vulkan_only";
+				return;
+			}
 			require(shaderEpoch > 0, "registered depth pipelines have no observed successful shader reload");
-			if (volume != null) {
+			// live-toggle repair 2026-09-21: volume can now outlive the flags that created it (reloaded()
+			// never tears it down on an on-to-off flip, matching the shadow mesh below), so a player who
+			// turns colored_light/voxel_gi/volumetric_light/wetness off must stop paying for tick() too --
+			// gated on the live config, not just "does the object exist".
+			if (volume != null && config.voxelVolumeNeeded()) {
 				var client = Minecraft.getInstance();
 				var camera = client.gameRenderer.gameRenderState().levelRenderState.cameraRenderState;
 				// glass-light brief: cheap volatile writes read back at snapshot-start/fill time (see
@@ -939,6 +1071,21 @@ final class DepthEffects {
 		return output;
 	}
 
+	private boolean backendSupported() {
+		String observed = RenderSystem.getDevice().getDeviceInfo().backendName().toLowerCase(Locale.ROOT);
+		if (observed.contains("opengl")) observed = "opengl";
+		else if (observed.contains("vulkan")) observed = "vulkan";
+		require(backend == null || backend.equals(observed), "depth backend changed");
+		backend = observed;
+		if (!observed.equals("opengl") || Boolean.getBoolean("bless.depth_on_opengl")) return true;
+		if (!backendWarned) {
+			backendWarned = true;
+			RmlsClient.LOGGER.warn("bless: graphics backend is opengl; the depth stage (shadows, light, gi, ao, reflections, "
+				+ "volumetrics) needs vulkan and stays off. video settings > graphics backend > vulkan, then restart");
+		}
+		return false;
+	}
+
 	private void observeTarget(RenderTarget main) {
 		require(main.width > 0 && main.height > 0 && main.getColorTexture() != null && main.getDepthTexture() != null,
 			"early world target unavailable");
@@ -952,11 +1099,6 @@ final class DepthEffects {
 			clearPool();
 			dirty = true;
 		}
-		String observed = RenderSystem.getDevice().getDeviceInfo().backendName().toLowerCase(Locale.ROOT);
-		if (observed.contains("opengl")) observed = "opengl";
-		else if (observed.contains("vulkan")) observed = "vulkan";
-		require(backend == null || backend.equals(observed), "depth backend changed");
-		backend = observed;
 	}
 
 	private void execute(RenderTarget main, DepthFrameInputs.Frame frame) {
@@ -1380,6 +1522,38 @@ final class DepthEffects {
 	}
 
 	void reloaded() {
+		// live-toggle repair 2026-09-21: the launch-vs-reload split. onInitializeClient() only builds
+		// the pipelines/volume/shadow mesh/chunk handlers the launch-time config asked for, because at
+		// boot that is the only config there is. everything below used to stay pinned to that first
+		// read forever -- a feature flag (colored_light, sun_shadows, voxel_gi, volumetric_light,
+		// sun_rays, glass_light, the three reflection kinds, wetness, ambient_occlusion,
+		// contact_shadows, haze, underwater_rays) turned on in the settings screen had nothing that
+		// ever finished its own bootstrap, so the player saw the base look until a full restart, even
+		// though the numeric knobs (tuning, below) really did apply live. this re-reads the config
+		// fresh and finishes whatever bootstrap the new flags need, before the early-out that only
+		// gates the per-frame tuning refresh.
+		ClientConfig fresh;
+		try {
+			fresh = ClientConfig.read(RmlsClient.configPath());
+		} catch (IOException failure) {
+			throw new IllegalStateException("bless configuration failed", failure);
+		}
+		ClientConfig old = config;
+		config = fresh;
+		if (!old.depthEnabled() && fresh.depthEnabled()) DepthPipelines.register();
+		state = fresh.depthEnabled() ? (state == null || state.equals("disabled") ? "waiting" : state) : "disabled";
+		boolean volumeNeededBefore = old.voxelVolumeNeeded(), volumeNeededAfter = fresh.voxelVolumeNeeded();
+		if (volumeNeededAfter && volume == null) volume = new VoxelVolume();
+		boolean shadowNeededBefore = old.sunShadows(), shadowNeededAfter = fresh.sunShadows();
+		if (shadowNeededAfter && shadowMesh == null) shadowMesh = new ShadowMesh(96);
+		boolean scanNeededBefore = old.metalReflections() || old.waterReflections() || old.glassReflections() || old.glassLight();
+		boolean scanNeededAfter = fresh.metalReflections() || fresh.waterReflections() || fresh.glassReflections() || fresh.glassLight();
+		// off-to-on re-feed: chunkLoaded/chunkUnloaded and lightChunkChanged only ever fire from the
+		// CHUNK_LOAD/CHUNK_UNLOAD events RmlsClient registers, so a tracker that just turned on has
+		// never seen any of the chunks already sitting in the client's loaded square -- feed it once,
+		// bounded to the render distance, the same shape a real chunk load would have handed it.
+		if ((!volumeNeededBefore && volumeNeededAfter) || (!scanNeededBefore && scanNeededAfter) || (!shadowNeededBefore && shadowNeededAfter))
+			feedLoadedChunks(!volumeNeededBefore && volumeNeededAfter);
 		if (!active()) return;
 		guard(() -> {
 			RenderSystem.assertOnRenderThread();
@@ -1393,6 +1567,31 @@ final class DepthEffects {
 			giHistoryValid = false;
 			dirty = true;
 		});
+	}
+
+	// live-toggle repair 2026-09-21: walks the client's own loaded square (bounded to
+	// Options.getEffectiveRenderDistance(), centered on the player's chunk) and replays it through
+	// chunkLoaded() -- which already no-ops per tracker via wantsMaterialScan()/config.sunShadows(),
+	// so calling it for every loaded chunk only actually feeds whichever tracker just turned on.
+	// lightChunkChanged() takes no chunk (VoxelVolume rebuilds its own flood fill from the player's
+	// position, not from a chunk list), so it is called once, not per chunk. verified against
+	// tools/mcapi ClientChunkCache (getChunk(int,int,ChunkStatus,boolean) returns null off-thread-safe
+	// for an unloaded chunk) and tools/mcapi Minecraft/Options (player field, getEffectiveRenderDistance()).
+	private void feedLoadedChunks(boolean feedVolume) {
+		Minecraft client = Minecraft.getInstance();
+		ClientLevel level = client.level;
+		if (level == null || client.player == null) return;
+		if (feedVolume) lightChunkChanged();
+		BlockPos playerPos = client.player.blockPosition();
+		int centerX = playerPos.getX() >> 4, centerZ = playerPos.getZ() >> 4;
+		int radius = client.options.getEffectiveRenderDistance();
+		ClientChunkCache chunkSource = level.getChunkSource();
+		for (int dx = -radius; dx <= radius; dx++) {
+			for (int dz = -radius; dz <= radius; dz++) {
+				LevelChunk chunk = chunkSource.getChunk(centerX + dx, centerZ + dz, ChunkStatus.FULL, false);
+				if (chunk != null) chunkLoaded(chunk);
+			}
+		}
 	}
 
 	void resize() { if (active()) guard(() -> { clearPool(); giHistoryValid = false; }); }
@@ -1455,6 +1654,11 @@ final class DepthEffects {
 		if (reflectionScratchTexture != null) guard(() -> { reflectionScratchView.close(); reflectionScratchTexture.close(); });
 		if (lightScratchTexture != null) guard(() -> { lightScratchView.close(); lightScratchTexture.close(); });
 		if (volume != null) guard(volume::close);
+		materialWorker.shutdownNow();
+		// a build that finished right as we're closing still holds native staging bytes -- free them
+		// rather than leaking (they were never handed to createBuffer, so no GpuBuffer owns them).
+		MaterialBuild strandedBuild = materialPendingResult.getAndSet(null);
+		if (strandedBuild != null) guard(() -> freeMaterialBuild(strandedBuild));
 		if (metalVertexBuffer != null) guard(metalVertexBuffer::close);
 		if (waterMaskVertexBuffer != null) guard(waterMaskVertexBuffer::close);
 		if (glassMaskVertexBuffer != null) guard(glassMaskVertexBuffer::close);
@@ -1596,6 +1800,9 @@ final class DepthEffects {
 		result.put("metal_tick_micros", lastMetalTickMicros);
 		result.put("metal_tick_micros_max", maxMetalTickMicros);
 		result.put("metal_tick_micros_p95", percentile95(metalTickRing, metalTickRingFilled));
+		// repair 2026-09-21 item 2: the worker's own last gather+fill time, now off the render thread --
+		// distinct from metal_tick_micros above, which is what the render thread itself paid this frame.
+		result.put("material_rebuild_ms", lastMaterialRebuildMillis);
 		// grass-glint brief item 4: water surfaces tracked by the same scan, next to metal's own.
 		result.put("water_blocks_tracked", metalScan.trackedWaterBlocks());
 		result.put("water_blocks_drawn", waterBlocksDrawnTotal);
